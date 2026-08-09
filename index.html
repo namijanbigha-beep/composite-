@@ -823,13 +823,12 @@ const InventoryEngine = {
     const p = getProdById(productId);
     if (!p) throw new Error('product not found');
     const available = this.getAvailable(productId, warehouseId);
-    if (available < quantity) throw new Error('INSUFFICIENT_STOCK');
     const snap = Storage.snapshot();
     try {
       const prevBal = p.stock[warehouseId] || 0;
       p.stock[warehouseId] = prevBal - quantity;
       const entry = createLedgerEntry(TX_TYPES.SALE, productId, warehouseId, -quantity, referenceType, referenceId, reason, null, prevBal);
-      engineAudit('inventory_sale', `فروش ${fmt(quantity)} ورق ${prodName(p)} از ${whName(warehouseId)}`, null, { qty: -quantity, wh: warehouseId });
+      engineAudit('inventory_sale', `فروش ${fmt(quantity)} ورق ${prodName(p)} از ${whName(warehouseId)}` + (available < quantity ? ' ⚠️ موجودی منفی' : ''), null, { qty: -quantity, wh: warehouseId });
       save();
       rebuildIndex();
       return entry;
@@ -1359,10 +1358,11 @@ const SalesCart = {
       return { success: false, error: validation.error };
     }
     
-    // Check stock
+    // Check stock — allow all users, track warnings for manager
     const available = InventoryEngine.getAvailable(productId, warehouse);
-    if (available < quantity && !isManager()) {
-      return { success: false, error: 'موجودی قابل فروش کافی نیست. موجودی: ' + available + ' ورق' };
+    if (available < quantity) {
+      if (!this._stockWarnings) this._stockWarnings = [];
+      this._stockWarnings.push({ productId, name: prodName(p), available, requested: quantity, warehouse });
     }
     
     // Check if item already exists in cart (same product + warehouse)
@@ -1501,10 +1501,11 @@ const SalesCart = {
         errors.push(item.name + ': ' + validation.error);
       }
       
-      // Check stock
+      // Check stock — warn instead of block
       const available = InventoryEngine.getAvailable(item.productId, item.wh);
-      if (available < item.qty && !isManager()) {
-        errors.push(item.name + ': موجودی کافی نیست (موجودی: ' + available + ')');
+      if (available < item.qty) {
+        if (!this._stockWarnings) this._stockWarnings = [];
+        this._stockWarnings.push({ productId: item.productId, name: item.name, available, requested: item.qty, warehouse: item.wh });
       }
     }
     
@@ -1538,6 +1539,7 @@ const SalesCart = {
     // Generate operation ID for idempotency
     this._operationId = 'op_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
     this._submitting = true;
+    this._stockWarnings = [];
     
     try {
       // Validate cart
@@ -1587,6 +1589,11 @@ const SalesCart = {
       };
       
       DB.invoices.push(inv);
+      
+      // Save stock warnings for manager alerts
+      if (this._stockWarnings && this._stockWarnings.length > 0) {
+        inv.stockWarnings = this._stockWarnings.slice();
+      }
       
       // Process inventory for regular invoices
       if (type !== 'proforma') {
@@ -1644,7 +1651,25 @@ const SalesCart = {
       save();
       this.clear();
       
-      return { success: true, invoice: inv, number, operationId: this._operationId };
+      // Show stock warning alerts to manager
+      if (inv.stockWarnings && inv.stockWarnings.length > 0 && isManager()) {
+        const warnMsg = inv.stockWarnings.map(w => `⚠️ ${w.name}: موجودی ${fmt(w.available)} — فروش ${fmt(w.requested)} (مانده: ${fmt(w.available - w.requested)})`).join('\n');
+        toast('⚠️ اخطار موجودی: ' + inv.stockWarnings.map(w => w.name + ' (موجودی: ' + fmt(w.available) + '، فروش: ' + fmt(w.requested) + ')').join(' | '));
+        // Also add to alerts array
+        if (!DB.alerts) DB.alerts = [];
+        DB.alerts.push({
+          id: uid(),
+          type: 'low-stock',
+          title: 'فروش با موجودی ناکافی — فاکتور شماره ' + inv.number,
+          message: inv.stockWarnings.map(w => `${w.name}: موجودی ${fmt(w.available)} ورق، فروش ${fmt(w.requested)} ورق`).join(' | '),
+          date: todayISO(),
+          read: false,
+          invoiceId: inv.id
+        });
+        save();
+      }
+      
+      return { success: true, invoice: inv, number, operationId: this._operationId, stockWarnings: inv.stockWarnings || [] };
     } finally {
       this._submitting = false;
       this._operationId = null;
@@ -2333,6 +2358,7 @@ function pageNewInvoice(){
   </div>
 
   <div class="card"><h3>۲. کالاها</h3>
+    <div style="margin-bottom:12px"><button class="btn sm" onclick="openBulkImportSheet()">📋 ورود گروهی از فاکتور</button></div>
     <div class="fast-search" style="margin-bottom:16px">
       <div class="field" style="margin-bottom:8px">
         <input id="fast-product-search" type="search" placeholder="جست‌وجوی سریع کالا — مثلاً مشکی 150" 
@@ -2432,6 +2458,48 @@ function lastSaleTo(cid,pid){
   for(const v of list){const it=v.items.find(i=>i.productId===pid);if(it)return it.price}
   return null;
 }
+/* =============== Bulk Import from Invoice Text =============== */
+function toLatDigits(s){return String(s).replace(/[۰-۹]/g,d=>'۰۱۲۳۴۵۶۷۸۹'.indexOf(d))}
+function parseInvoiceLine(line){
+  var s=toLatDigits(line).replace(/[\u200C\u200D\u200E\u200F\uFEFF]/g,'');
+  var m=s.match(/^(.+?)\s*\/\s*(\d+)\s*میل\s*\/\s*(.+?)\s*\/\s*(\d+)\s*[x×]\s*(\d+)/i);
+  if(!m)return null;
+  return{brand:m[1].trim(),th:m[2]+' میل',color:m[3].trim(),w:parseInt(m[4])||125,l:parseInt(m[5])||0};
+}
+function parseQtyLine(line){
+  var s=toLatDigits(line).replace(/[\u200C\u200D\u200E\u200F\uFEFF]/g,'');
+  var m=s.match(/(\d+)\s*ورق/);
+  return m?parseInt(m[1]):0;
+}
+function bulkImportItems(text){
+  if(!draft)draft=newDraft("invoice");
+  var allLines=text.split("\n");
+  var items=[];
+  var cur=null,curQty=0;
+  for(var i=0;i<allLines.length;i++){
+    var hdr=parseInvoiceLine(allLines[i]);
+    if(hdr){
+      if(cur&&cur.l&&curQty>0)items.push({brand:cur.brand,th:cur.th,color:cur.color,w:cur.w,l:cur.l,qty:curQty});
+      cur=hdr;curQty=0;
+    }
+    var q=parseQtyLine(allLines[i]);
+    if(q>0)curQty=q;
+  }
+  if(cur&&cur.l&&curQty>0)items.push({brand:cur.brand,th:cur.th,color:cur.color,w:cur.w,l:cur.l,qty:curQty});
+  var added=0,blocked=0,created=0;
+  for(var j=0;j<items.length;j++){
+    var it=items[j];var w=it.w||125,l=it.l;
+    if(!l){blocked++;continue}
+    var p=DB.products.find(function(x){return x.brand===it.brand&&x.thickness===it.th&&x.color===it.color&&x.width===w&&x.length===l});
+    if(!p){p={id:uid(),brand:it.brand,thickness:it.th,color:it.color,width:w,length:l,stock:{qom:0,jaf:0},minStock:0,costPrice:0,salePrice:0,minPrice:0,shelf:""};DB.products.push(p);DB.pendingMin=DB.pendingMin||[];DB.pendingMin.push(p.id);created++}
+    var area=w*l/10000;
+    var result=SalesCart.addItem(p.id,{quantity:it.qty,price:Math.round(880000*area),warehouse:"jaf",unit:"sheet"});
+    if(result.success)added++;else blocked++;
+  }
+  if(created)save();
+  saveDraft();render();
+  toast(faNum(added)+" \u0631\u062F\u06CC\u0641 \u0627\u0636\u0627\u0641\u0647 \u0634\u062F"+(created?" \u2014 "+faNum(created)+" \u06A9\u0627\u0644\u0627\u06CC \u062C\u062F\u06CC\u062F":"")+(blocked?" \u2014 "+faNum(blocked)+" \u0631\u062F\u06CC\u0641 \u0631\u062F \u0634\u062D":""));
+}
 function qmAdd(){
   if(!draft.qm)draft.qm={brand:"",th:"۴ میل",color:"",w:"125",pm:"",wh:"qom",mode:"m2"};
   const g=id=>{const e=document.querySelector(id);return e?e.value:""};
@@ -2463,6 +2531,61 @@ function qmAdd(){
   if(fresh.length)msg+=" — "+faNum(fresh.length)+" کالای جدید تعریف شد";
   if(blocked)msg+=" — "+faNum(blocked)+" ردیف به دلیل قیمت کمتر از حداقل مجاز اضافه نشد";
   toast(msg);
+}
+function openBulkImportSheet(){
+  openModal(`<h3>ورود گروهی از فاکتور</h3>
+    <div class="sub" style="margin-bottom:12px">متن فاکتور را کپی کنید و در کادر زیر بچسبانید. فرمت هر کالا دو خطی است:</div>
+    <div class="sub" style="margin-bottom:12px;background:var(--md-surface-1);padding:10px;border-radius:8px;font-size:13px;line-height:2">
+      <b>خط ۱:</b> برند / ۴ میل / رنگ / ۱۲۵×۲۴۳<br>
+      <b>خط ۲:</b> ۲ ورق<br>
+      <span style="color:var(--md-on-surface-variant)">قیمت، متراژ، ویرایش، حذف — همه نادیده گرفته می‌شوند.</span>
+    </div>
+    <div class="field"><label>متن فاکتور</label><textarea id="bulk-import-text" rows="14" placeholder="الکواستون اکونومی / ۴ میل / سفید / ۱۲۵×۲۴۳&#10;۲ ورق&#10;&#10;پرمیوم باند / ۴ میل / مشکی / ۱۲۵×۲۳۲&#10;۶ ورق" style="font-size:12px;direction:rtl"></textarea></div>
+    <div class="grid2">
+      <div class="field"><label>قیمت هر مترمربع (تومان)</label><input id="bulk-import-price" inputmode="numeric" value="880000" oninput="fmtPriceInput(this)"></div>
+      <div class="field"><label>انبار</label><select id="bulk-import-wh"><option value="jaf">جعفریه</option><option value="qom">قم</option></select></div>
+    </div>
+    <div class="actions"><button class="btn primary" onclick="doBulkImport()">افزودن همه ردیف‌ها</button><button class="btn" onclick="closeModal()">انصراف</button></div>`);
+}
+function doBulkImport(){
+  const text=document.querySelector("#bulk-import-text")?.value||"";
+  const price=deNum(document.querySelector("#bulk-import-price")?.value)||880000;
+  const wh=document.querySelector("#bulk-import-wh")?.value||"jaf";
+  if(!text.trim()){toast("متن فاکتور را وارد کنید.");return}
+  closeModal();
+  // Override price and wh in bulkImportItems
+  const origAdd=SalesCart.addItem.bind(SalesCart);
+  bulkImportItemsCustom(text,price,wh);
+}
+function bulkImportItemsCustom(text,defaultPrice,defaultWh){
+  if(!draft)draft=newDraft("invoice");
+  var allLines=text.split("\n");
+  var items=[];
+  var cur=null,curQty=0;
+  for(var i=0;i<allLines.length;i++){
+    var hdr=parseInvoiceLine(allLines[i]);
+    if(hdr){
+      if(cur&&cur.l&&curQty>0)items.push({brand:cur.brand,th:cur.th,color:cur.color,w:cur.w,l:cur.l,qty:curQty});
+      cur=hdr;curQty=0;
+    }
+    var q=parseQtyLine(allLines[i]);
+    if(q>0)curQty=q;
+  }
+  if(cur&&cur.l&&curQty>0)items.push({brand:cur.brand,th:cur.th,color:cur.color,w:cur.w,l:cur.l,qty:curQty});
+  var added=0,blocked=0,created=0;
+  for(var j=0;j<items.length;j++){
+    var it=items[j];var w=it.w||125,l=it.l;
+    if(!l){blocked++;continue}
+    var p=DB.products.find(function(x){return x.brand===it.brand&&x.thickness===it.th&&x.color===it.color&&x.width===w&&x.length===l});
+    if(!p){p={id:uid(),brand:it.brand,thickness:it.th,color:it.color,width:w,length:l,stock:{qom:0,jaf:0},minStock:0,costPrice:0,salePrice:0,minPrice:0,shelf:""};DB.products.push(p);DB.pendingMin=DB.pendingMin||[];DB.pendingMin.push(p.id);created++}
+    var area=w*l/10000;
+    var pricePerSheet=Math.round(defaultPrice*area);
+    var result=SalesCart.addItem(p.id,{quantity:it.qty,price:pricePerSheet,warehouse:defaultWh,unit:"sheet"});
+    if(result.success)added++;else blocked++;
+  }
+  if(created)save();
+  saveDraft();render();
+  toast(faNum(added)+" \u0631\u062F\u06CC\u0641 \u0627\u0636\u0627\u0641\u0647 \u0634\u062F"+(created?" \u2014 "+faNum(created)+" \u06A9\u0627\u0644\u0627\u06CC \u062C\u062F\u06CC\u062F":"")+(blocked?" \u2014 "+faNum(blocked)+" \u0631\u062F\u06CC\u0641 \u0631\u062F \u0634\u062F":""));
 }
 function addItem(){
   const f=draft.form;
@@ -2610,6 +2733,7 @@ function pageInvoiceDetail(){
     <button class="btn sm" onclick="go('invoices')">← بازگشت</button>
   </div>
   ${v.status==="باطل‌شده"?`<div class="notice red">این فاکتور باطل شده است. دلیل: ${esc(v.cancelReason||"—")} — کالاها به موجودی بازگشته‌اند و پرداخت‌ها به‌صورت بستانکاری مشتری باقی مانده‌اند.</div>`:""}
+  ${isManager()&&v.stockWarnings&&v.stockWarnings.length?`<div class="notice orange">⚠️ اخطار موجودی: ${v.stockWarnings.map(w=>esc(w.name)+' (موجودی: '+fmt(w.available)+', فروش: '+fmt(w.requested)+')').join(' | ')}</div>`:""}
   <div class="card">
     <div class="custchip" style="margin-bottom:14px"><div><b>${esc(c?.name||"—")}</b> <span class="sub">${esc(c?.phone||"")}</span></div>
       <button class="btn sm" onclick="go('customerDetail','${v.customerId}')">صفحه مشتری</button></div>
@@ -3116,7 +3240,18 @@ function exportInventoryExcel(){
     if(!lastEntryDate[e.productId]||d>lastEntryDate[e.productId])lastEntryDate[e.productId]=d;
   });
 
-  const head=["برند","ضخامت","رنگ","عرض","طول","قم","جعفریه","کل","حداقل موجودی","حداقل قیمت","قیمت فروش","قیمت/م²","وضعیت","قفسه","تاریخ آخرین ورود"];
+  // Build last discharge date map per product (from truckHistory)
+  const lastDischargeDate={};
+  (DB.truckHistory||[]).forEach(h=>{
+    if(!h.date||!h.items)return;
+    const d=h.date.slice(0,10);
+    h.items.forEach(item=>{
+      const key=[item.brand,item.thickness,item.color,item.width,item.length].join("|");
+      if(!lastDischargeDate[key]||d>lastDischargeDate[key])lastDischargeDate[key]=d;
+    });
+  });
+
+  const head=["برند","ضخامت","رنگ","عرض","طول","قم","جعفریه","کل","حداقل موجودی","حداقل قیمت","قیمت فروش","قیمت/م²","وضعیت","قفسه","تاریخ آخرین ورود","تاریخ تخلیه"];
   if(canViewCostPrice())head.push("قیمت تمام‌شده","ارزش موجودی");
   const rows=[head];
 
@@ -3126,7 +3261,9 @@ function exportInventoryExcel(){
     const stock=totStock(p);
     const status=stock===0?"ناموجود":stock<=2?"محدود":"موجود";
     const lastDate=lastEntryDate[p.id]||"";
-    const r=[p.brand,p.thickness,p.color,p.width,p.length,p.stock.qom||0,p.stock.jaf||0,stock,p.minStock||0,p.minPrice||0,p.salePrice||0,pm2,status,p.shelf||"",lastDate];
+    const dk=[p.brand,p.thickness,p.color,p.width,p.length].join("|");
+    const dischargeDate=lastDischargeDate[dk]||"";
+    const r=[p.brand,p.thickness,p.color,p.width,p.length,p.stock.qom||0,p.stock.jaf||0,stock,p.minStock||0,p.minPrice||0,p.salePrice||0,pm2,status,p.shelf||"",lastDate,dischargeDate];
     if(canViewCostPrice())r.push(p.costPrice||0,stock*(p.costPrice||0));
     rows.push(r);
   });
@@ -3134,7 +3271,7 @@ function exportInventoryExcel(){
   const ws=XLSX.utils.aoa_to_sheet(rows);
 
   // Column widths
-  const cols=[{wch:16},{wch:10},{wch:14},{wch:8},{wch:8},{wch:8},{wch:10},{wch:8},{wch:12},{wch:14},{wch:14},{wch:12},{wch:10},{wch:10},{wch:14}];
+  const cols=[{wch:16},{wch:10},{wch:14},{wch:8},{wch:8},{wch:8},{wch:10},{wch:8},{wch:12},{wch:14},{wch:14},{wch:12},{wch:10},{wch:10},{wch:14},{wch:14}];
   if(canViewCostPrice())cols.push({wch:14},{wch:14});
   ws["!cols"]=cols;
 
@@ -5207,12 +5344,17 @@ function pageInventoryAlerts(){
   (DB.approvals||[]).filter(a=>a.status==="PENDING").forEach(a=>{
     alerts.push({type:"pending",approval:a});
   });
+  // Invoice-based stock warnings
+  (DB.alerts||[]).filter(a=>a.type==="low-stock"&&!a.read).forEach(a=>{
+    alerts.push({type:"invoice-low-stock",alert:a});
+  });
   return `
   <div class="pagehead"><div><div class="h1">${ic("bell",22)} هشدارهای انبار</div><div class="sub">${faNum(alerts.length)} هشدار فعال</div></div></div>
   ${alerts.length?alerts.map(a=>{
     if(a.type==="low-stock")return `<div class="alert-card"><div class="alert-icon low-stock">!</div><div class="alert-content"><div class="alert-title">موجودی کم: ${prodName(a.product)}</div><div class="alert-desc">${whName(a.warehouse.id)} — موجودی: ${faNum(a.stock)} — رزرو: ${faNum(a.reserved)} — در دسترس: ${faNum(a.available)} (حداقل: ${faNum(a.minStock)})</div></div></div>`;
     if(a.type==="aging")return `<div class="alert-card"><div class="alert-icon aging">⏰</div><div class="alert-content"><div class="alert-title">رزروی قدیمی: ${faNum(a.ageDays)} روز</div><div class="alert-desc">${getProd(a.reservation.productId)?prodName(getProd(a.reservation.productId)):"—"} — ${whName(a.reservation.warehouseId)} — ${faNum(a.reservation.quantity)} واحد</div></div></div>`;
     if(a.type==="pending")return `<div class="alert-card"><div class="alert-icon pending">⏳</div><div class="alert-content"><div class="alert-title">درخواست تأیید: ${esc(a.approval.type)}</div><div class="alert-desc">${esc(a.approval.reason||"—")} — ${esc(a.approval.requestedBy)}</div></div></div>`;
+    if(a.type==="invoice-low-stock")return `<div class="alert-card"><div class="alert-icon low-stock">⚠️</div><div class="alert-content"><div class="alert-title">${esc(a.alert.title)}</div><div class="alert-desc">${esc(a.alert.message)} — ${faDate(a.alert.date)}</div></div></div>`;
     return "";
   }).join(""):'<div class="card"><div class="empty">✓ هشداری وجود ندارد.</div></div>'}`;
 }
