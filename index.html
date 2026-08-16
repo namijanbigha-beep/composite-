@@ -769,8 +769,13 @@ function getProdById(id) {
   if (!_productIndex) buildProductIndex();
   const found = _productIndex.get(id);
   if (found) return found;
-  // Fallback: try to find by matching product properties from proforma items
-  // This handles cases where product was deleted/recreated with new ID
+  // Index can go stale the moment a new product is pushed straight onto
+  // DB.products without going through a path that calls rebuildIndex()
+  // (e.g. the quick multi-length add flow). Fall back to a direct scan
+  // instead of failing outright, and refresh the index so subsequent
+  // lookups are fast again.
+  const direct = DB.products.find(p => p.id === id);
+  if (direct) { rebuildIndex(); return direct; }
   return null;
 }
 // Find product by matching properties (brand, thickness, color, width, length) — fallback for stale references
@@ -1399,7 +1404,7 @@ const SalesCart = {
     const p = getProd(productId);
     if (!p) return { success: false, error: 'کالا یافت نشد' };
     
-    const { quantity = 1, price = null, warehouse = 'qom', unit = 'sheet' } = options;
+    const { quantity = 1, price = null, warehouse = 'qom', unit = 'sheet', lengthPricingCategory: passedCategory = null, lengthPricingM2Price: passedM2Price = null } = options;
     
     // Check if item already exists in cart (same product + warehouse)
     const existingIndex = this._cart.items.findIndex(i => 
@@ -1439,10 +1444,11 @@ const SalesCart = {
     const unitPrice = unit === 'm2' ? Math.round(finalPrice / area) : finalPrice;
     const lineTotal = unit === 'm2' ? Math.round(unitPrice * area * quantity) : finalPrice * quantity;
     
-    // Determine length pricing category label
-    let lengthPricingCategory = null;
-    let lengthPricingM2Price = null;
-    if (lengthPricingResult) {
+    // Determine length pricing category label — prefer what the caller already
+    // computed (qmAdd / quick-add modal), otherwise fall back to what we derived above
+    let lengthPricingCategory = passedCategory || null;
+    let lengthPricingM2Price = passedM2Price || null;
+    if (!lengthPricingCategory && lengthPricingResult) {
       lengthPricingCategory = lengthPricingResult.category;
       lengthPricingM2Price = lengthPricingResult.m2Price;
     }
@@ -2475,7 +2481,7 @@ function pageNewInvoice(){
         <div class="field"><label>انبار</label><select id="qm-wh" onchange="draft.qm.wh=this.value;saveDraft()">${WH.map(w=>`<option value="${w.id}" ${qm.wh===w.id?"selected":""}>${w.name}</option>`).join("")}</select></div>
       </div>
       <div class="grid3">
-        <div class="field"><label>${qm.mode==='sheet'?"قیمت هر ورق (تومان)":"قیمت هر مترمربع (تومان)"}</label><input id="qm-pm" inputmode="numeric" placeholder="${qm.mode==='sheet'?'مثلاً 2,900,000':'مثلاً 1,250,000'}" value="${qm.pm?Number(deNum(qm.pm)).toLocaleString("en-US"):""}" oninput="fmtPriceInput(this);draft.qm.pm=this.value;saveDraft()"></div>
+        <div class="field"><label>${qm.mode==='sheet'?"قیمت هر ورق (تومان)":"قیمت هر مترمربع (تومان)"}${(draft.lengthPricing&&draft.lengthPricing.enabled)?' — غیرفعال (قیمت‌گذاری بر اساس طول فعال است)':''}</label><input id="qm-pm" inputmode="numeric" placeholder="${(draft.lengthPricing&&draft.lengthPricing.enabled)?'بر اساس طول محاسبه می‌شود':(qm.mode==='sheet'?'مثلاً 2,900,000':'مثلاً 1,250,000')}" value="${qm.pm?Number(deNum(qm.pm)).toLocaleString("en-US"):""}" oninput="fmtPriceInput(this);draft.qm.pm=this.value;saveDraft()" ${(draft.lengthPricing&&draft.lengthPricing.enabled)?'disabled':''}></div>
         <div class="field" style="grid-column:span 2"><label>طول‌ها (سانتی‌متر) — با خط تیره یا فاصله جدا کن و Enter بزن</label><input id="qm-lens" inputmode="numeric" placeholder="مثلاً ۱۸۷-۱۸۴-۱۵۸-۱۶۱" onkeydown="if(event.key==='Enter'){event.preventDefault();qmAdd()}"></div>
       </div>
       <button class="btn primary sm" onclick="qmAdd()">+ افزودن طول‌ها</button>
@@ -2631,6 +2637,7 @@ function bulkImportItems(text){
   toast(faNum(added)+" \u0631\u062F\u06CC\u0641 \u0627\u0636\u0627\u0641\u0647 \u0634\u062F"+(created?" \u2014 "+faNum(created)+" \u06A9\u0627\u0644\u0627\u06CC \u062C\u062F\u06CC\u062F":"")+(blocked?" \u2014 "+faNum(blocked)+" \u0631\u062F\u06CC\u0641 \u0631\u062F \u0634\u062D":""));
 }
 function qmAdd(){
+  if(qmAdd._busy)return; // guard against double Enter/double-click firing this twice
   if(!draft.qm)draft.qm={brand:"",th:"۴ میل",color:"",w:"125",pm:"",wh:"qom",mode:"m2"};
   const g=id=>{const e=document.querySelector(id);return e?e.value:""};
   const brand=(g("#qm-brand")||"").trim();
@@ -2641,35 +2648,51 @@ function qmAdd(){
   const wh=g("#qm-wh")||draft.qm.wh||"qom";
   Object.assign(draft.qm,{brand,th,color:g("#qm-color"),w:String(w),pm:g("#qm-pm"),wh});
   if(!brand){toast("نام برند را بنویسید.");return}
-  if(pm<=0){toast(draft.qm.mode==="sheet"?"قیمت هر ورق را وارد کنید.":"قیمت هر مترمربع را وارد کنید.");return}
-  const lens=latinDigits(g("#qm-lens")).split(/[^0-9.]+/).map(Number).filter(x=>x>0);
-  if(!lens.length){toast("حداقل یک طول وارد کنید.");return}
-  const fresh=[];let blocked=0;const mode=(draft.qm.mode==="sheet")?"sheet":"m2";
-  lens.forEach(L=>{
-    let p=DB.products.find(x=>x.brand===brand&&x.thickness===th&&x.color===color&&x.width===w&&x.length===L);
-    if(!p){p={id:uid(),brand,thickness:th,color,width:w,length:L,stock:{qom:0,jaf:0},minStock:0,costPrice:0,salePrice:0,minPrice:0,shelf:""};DB.products.push(p);DB.pendingMin=DB.pendingMin||[];DB.pendingMin.push(p.id);fresh.push(p)}
-    // Use length-based pricing if enabled
-    let price;
-    const lpResult=calculateLengthBasedPrice(p,draft);
-    if(lpResult){
-      price=mode==="sheet"?lpResult.sheetPrice:lpResult.m2Price;
-    } else {
-      price=mode==="sheet"?Math.round(pm):Math.round(w*L*pm/10000);
+  const lenPricingOn=!!(draft.lengthPricing&&draft.lengthPricing.enabled);
+  if(lenPricingOn){
+    if(!(Number(draft.lengthPricing.shortM2Price)>0)||!(Number(draft.lengthPricing.longM2Price)>0)){
+      toast("قیمت «تا حد» و «بالای حد» را در بخش قیمت‌گذاری بر اساس طول وارد کنید.");return;
     }
-    if(!isManager()&&p.minPrice&&price<p.minPrice){blocked++;return}
-    if(fresh.includes(p))InventoryEngine.receive({ productId: p.id, warehouseId: wh, quantity: 1, referenceType: 'quick_entry', referenceId: '', reason: 'ورود سریع' });
-    const itemOpts={quantity:1,price:price,warehouse:wh,unit:mode};
-    if(lpResult){itemOpts.price=lpResult.sheetPrice;}
-    const result=SalesCart.addItem(p.id,itemOpts);
-    if(!result.success){blocked++;return}
-  });
-  if(fresh.length)save();
-  saveDraft();render();
-  setTimeout(()=>{const e=document.querySelector("#qm-lens");if(e){e.value="";e.focus()}},30);
-  let msg=faNum(lens.length-blocked)+" ردیف اضافه شد";
-  if(fresh.length)msg+=" — "+faNum(fresh.length)+" کالای جدید تعریف شد";
-  if(blocked)msg+=" — "+faNum(blocked)+" ردیف به دلیل قیمت کمتر از حداقل مجاز اضافه نشد";
-  toast(msg);
+  } else if(pm<=0){
+    toast(draft.qm.mode==="sheet"?"قیمت هر ورق را وارد کنید.":"قیمت هر مترمربع را وارد کنید.");return;
+  }
+  const lensEl=document.querySelector("#qm-lens");
+  const lens=latinDigits(lensEl?lensEl.value:"").split(/[^0-9.]+/).map(Number).filter(x=>x>0);
+  if(!lens.length){toast("حداقل یک طول وارد کنید.");return}
+  qmAdd._busy=true;
+  if(lensEl)lensEl.value=""; // clear immediately so a repeated Enter/click can't resubmit the same lengths
+  try{
+    const fresh=[];let blocked=0;const mode=(draft.qm.mode==="sheet")?"sheet":"m2";
+    lens.forEach(L=>{
+      let p=DB.products.find(x=>x.brand===brand&&x.thickness===th&&x.color===color&&x.width===w&&x.length===L);
+      if(!p){p={id:uid(),brand,thickness:th,color,width:w,length:L,stock:{qom:0,jaf:0},minStock:0,costPrice:0,salePrice:0,minPrice:0,shelf:""};DB.products.push(p);DB.pendingMin=DB.pendingMin||[];DB.pendingMin.push(p.id);fresh.push(p)}
+      // Use length-based pricing if enabled — price is always the TOTAL per-sheet price,
+      // matching what the non-automatic branch computes, so the min-price check and
+      // SalesCart.addItem (which expects a sheet total regardless of unit mode) stay consistent.
+      let price;
+      const lpResult=calculateLengthBasedPrice(p,draft);
+      if(lpResult){
+        price=lpResult.sheetPrice;
+      } else {
+        price=mode==="sheet"?Math.round(pm):Math.round(w*L*pm/10000);
+      }
+      if(!isManager()&&p.minPrice&&price<p.minPrice){blocked++;return}
+      if(fresh.includes(p))InventoryEngine.receive({ productId: p.id, warehouseId: wh, quantity: 1, referenceType: 'quick_entry', referenceId: '', reason: 'ورود سریع' });
+      const itemOpts={quantity:1,price:price,warehouse:wh,unit:mode};
+      if(lpResult){itemOpts.lengthPricingCategory=lpResult.category;itemOpts.lengthPricingM2Price=lpResult.m2Price;}
+      const result=SalesCart.addItem(p.id,itemOpts);
+      if(!result.success){blocked++;return}
+    });
+    if(fresh.length)save();
+    saveDraft();render();
+    setTimeout(()=>{const e=document.querySelector("#qm-lens");if(e){e.focus()}},30);
+    let msg=faNum(lens.length-blocked)+" ردیف اضافه شد";
+    if(fresh.length)msg+=" — "+faNum(fresh.length)+" کالای جدید تعریف شد";
+    if(blocked)msg+=" — "+faNum(blocked)+" ردیف به دلیل قیمت کمتر از حداقل مجاز اضافه نشد";
+    toast(msg);
+  }finally{
+    qmAdd._busy=false;
+  }
 }
 function openBulkImportSheet(){
   openModal(`<h3>ورود گروهی از فاکتور</h3>
@@ -2736,12 +2759,14 @@ function addItem(){
   if(!p){toast("ابتدا برند، ضخامت، رنگ و ابعاد را انتخاب کنید.");return}
   const qty=Math.floor(deNum(f.qty)),price=deNum(f.price);
   if(qty<=0){toast("تعداد ورق باید عدد صحیح مثبت باشد.");return}
-  if(price<=0){toast("قیمت فروش هر ورق را وارد کنید.");return}
-  // Use length-based pricing if enabled and no manual price override
+  // Use length-based pricing if enabled and no manual price was typed
+  const lpResult=(price<=0)?calculateLengthBasedPrice(p,draft):null;
   let finalPrice=price;
-  const lpResult=calculateLengthBasedPrice(p,draft);
-  if(lpResult&&price<=0){finalPrice=lpResult.sheetPrice;}
-  const result=SalesCart.addItem(p.id,{quantity:qty,price:finalPrice,warehouse:f.wh||"qom"});
+  if(lpResult){finalPrice=lpResult.sheetPrice;}
+  else if(price<=0){toast("قیمت فروش هر ورق را وارد کنید.");return}
+  const itemOpts={quantity:qty,price:finalPrice,warehouse:f.wh||"qom"};
+  if(lpResult){itemOpts.lengthPricingCategory=lpResult.category;itemOpts.lengthPricingM2Price=lpResult.m2Price;}
+  const result=SalesCart.addItem(p.id,itemOpts);
   if(!result.success){toast(result.error);return}
   draft.form={brand:"",thickness:"",color:"",pid:"",wh:f.wh||"qom",qty:"",price:""};
   render();
@@ -6965,10 +6990,12 @@ function openQuickAddModal(product){
   const basePrice=p.salePrice||0;
   const minPrice=p.minPrice||0;
   const custPrice=pricing||0;
-  const finalPrice=custPrice||basePrice;
+  const lpResult=calculateLengthBasedPrice(p,draft);
+  const finalPrice=lpResult?lpResult.sheetPrice:(custPrice||basePrice);
   
   const d=document.createElement("div");
   d.className="cat6-overlay";
+  if(lpResult){d.dataset.lpCategory=lpResult.category;d.dataset.lpM2Price=lpResult.m2Price;d.dataset.lpSheetPrice=lpResult.sheetPrice;}
   d.onclick=function(ev){if(ev.target===d)d.remove()};
   d.innerHTML=`<div class="cat6-modal cat6-quick-add">
     <h3>افزودن به سبد</h3>
@@ -6979,13 +7006,14 @@ function openQuickAddModal(product){
       ${avail!==null?`<div class="cat6-qa-stock ${avail>0?'green':'red'}">${avail>0?"موجودی: "+faNum(avail):"ناموجود"}</div>`:''}
     </div>
     <div class="cat6-pricing">
+      ${lpResult?`<div class="cat6-price-row"><span>قیمت بر اساس طول:</span><span class="num green">${toman(lpResult.sheetPrice)} <span class="len-price-badge ${lpResult.category}">${lpResult.category==='short'?'تا حد':'بالای حد'}</span></span></div>`:''}
       ${basePrice?`<div class="cat6-price-row"><span>قیمت پایه:</span><span class="num">${toman(basePrice)}</span></div>`:''}
       ${custPrice?`<div class="cat6-price-row"><span>قیمت مشتری:</span><span class="num green">${toman(custPrice)}</span></div>`:''}
       ${minPrice?`<div class="cat6-price-row"><span>حداقل قیمت:</span><span class="num orange">${toman(minPrice)}</span></div>`:''}
     </div>
     <div class="cat6-qa-form">
       <div class="field"><label>تعداد</label><input id="cat6-qa-qty" type="number" value="1" min="1" inputmode="numeric"></div>
-      <div class="field"><label>قیمت واحد (تومان)</label><input id="cat6-qa-price" inputmode="numeric" value="${finalPrice||''}" oninput="fmtPriceInput(this)"></div>
+      <div class="field"><label>قیمت واحد (تومان)${lpResult?' — پیشنهادی بر اساس طول، در صورت نیاز قابل ویرایش است':''}</label><input id="cat6-qa-price" inputmode="numeric" value="${finalPrice||''}" oninput="fmtPriceInput(this)"></div>
     </div>
     <div class="cat6-qa-preview" id="cat6-qa-preview"></div>
     <div class="actions">
@@ -7016,12 +7044,18 @@ function openQuickAddModal(product){
 function cat6ConfirmQuickAdd(productId){
   const p=(DB.products||[]).find(x=>x.id===productId);
   if(!p)return;
+  const overlay=document.querySelector(".cat6-overlay");
   const qty=Number(document.getElementById("cat6-qa-qty").value)||1;
   const price=deNum(document.getElementById("cat6-qa-price").value)||0;
   
   if(price<=0){toast("قیمت را وارد کنید.");return}
   
-  const result=SalesCart.addItem(p.id,{quantity:qty,price:price,warehouse:"qom",unit:"sheet"});
+  const itemOpts={quantity:qty,price:price,warehouse:"qom",unit:"sheet"};
+  if(overlay&&overlay.dataset.lpCategory&&Number(overlay.dataset.lpSheetPrice)===price){
+    itemOpts.lengthPricingCategory=overlay.dataset.lpCategory;
+    itemOpts.lengthPricingM2Price=Number(overlay.dataset.lpM2Price);
+  }
+  const result=SalesCart.addItem(p.id,itemOpts);
   if(result.success){
     document.querySelector(".cat6-overlay").remove();
     toast(p.brand+" "+p.color+" به سبد اضافه شد.");
@@ -7327,6 +7361,7 @@ function syncMerge(incoming){
   const localLastSync=syncStamp();
   const incomingLastUpdate=incoming.db._lastUpdated||0;
   const localLastUpdate=DB._lastUpdated||0;
+  const incomingDB=incoming.db;
   
   // Conflict: both devices made changes since last sync
   if(localLastUpdate>localLastSync&&incomingLastUpdate>localLastSync){
@@ -7352,7 +7387,6 @@ function syncMerge(incoming){
     
     // For other data, prefer the higher version
     // But preserve local inventory counts (never overwrite stock directly)
-    const incomingDB=incoming.db;
     if(incomingDB.products){
       incomingDB.products.forEach(ip=>{
         const lp=DB.products.find(p=>p.id===ip.id);
@@ -7387,14 +7421,15 @@ function syncMerge(incoming){
 }
 
 async function syncPush(){
-  if(!SYNC.url)return;
+  if(!SYNC.url)return false;
   const t=Date.now();
   bumpDBVersion();
   try{
     const r=await fetch(syncEndpoint(),{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({updatedAt:t,version:getDBVersion(),db:DB})});
     if(!r.ok)throw new Error("st"+r.status);
     SYNC.status="ok";SYNC.err="";syncSetStamp(t);syncBadge();
-  }catch(e){SYNC.status="err";SYNC.err="ارسال به سرور ممکن نشد";syncBadge()}
+    return true;
+  }catch(e){SYNC.status="err";SYNC.err="ارسال به سرور ممکن نشد";syncBadge();return false}
 }
 function syncQueuePush(){if(!SYNC.url)return;clearTimeout(SYNC.pushT);SYNC.pushT=setTimeout(syncPush,1200)}
 async function syncPull(){
@@ -7438,10 +7473,18 @@ async function syncConnect(){
   if(!r.ok)throw new Error("bad");
   const data=await r.json();
   SYNC.url=u;SYNC.auth=a;localStorage.setItem("cs_sync_url",u);localStorage.setItem("cs_sync_auth",a);
-  if(data&&data.db&&Number(data.updatedAt||0)>syncStamp()){DB=data.db;DB.pendingMin=DB.pendingMin||[];try{localStorage.setItem(KEY,JSON.stringify(DB))}catch(e){}syncSetStamp(Number(data.updatedAt))}
-  else await syncPush();
-  SYNC.status="ok";SYNC.err="";
-  closeModal();render();toast("همگام‌سازی آنلاین فعال شد.");
+  let ok=true;
+  if(data&&data.db&&Number(data.updatedAt||0)>syncStamp()){
+    DB=data.db;DB.pendingMin=DB.pendingMin||[];
+    try{localStorage.setItem(KEY,JSON.stringify(DB))}catch(e){}
+    syncSetStamp(Number(data.updatedAt));
+    SYNC.status="ok";SYNC.err="";
+  }else{
+    ok=await syncPush();
+  }
+  closeModal();render();
+  if(ok)toast("همگام‌سازی آنلاین فعال شد.");
+  else toast("اتصال برقرار شد اما ارسال داده به سرور ناموفق بود — لطفاً دوباره تلاش کنید.");
 }
 function syncDisconnect(){SYNC.url="";SYNC.auth="";SYNC.status="off";localStorage.removeItem("cs_sync_url");localStorage.removeItem("cs_sync_auth");closeModal();render();toast("همگام‌سازی غیرفعال شد.")}
 
