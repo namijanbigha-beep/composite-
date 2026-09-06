@@ -16167,6 +16167,1267 @@ window.invPayNow=function(invId,cid){
 
 })();
 
+
+/* ============== ROUND 24: خرید کارخانه بر اساس طول/مترمربع + تفکیک حد طول در فاکتور ============== */
+(function(){
+
+  /* ---------------- helpers ---------------- */
+  function n(x){ var v = Number(x); return isFinite(v) ? v : 0; }
+  function den(x){ try{ return n(deNum(x)); }catch(e){ return n(x); } }
+  function a1(x){ try{ return area1(x); }catch(e){ return (Math.round(n(x)*10)/10).toString(); } }
+  function fa(x){ try{ return faNum(x); }catch(e){ return String(x); } }
+  function money(x){ try{ return fmt(Math.round(n(x))); }catch(e){ return String(Math.round(n(x))); } }
+
+  function prodOf(i){ try{ return getProd(i.productId); }catch(e){ return null; } }
+  function itemLen(i){
+    var l = n(i && i.length);
+    if(!l){ var p = prodOf(i); l = p ? n(p.length) : 0; }
+    return l;
+  }
+  function itemWidth(i){
+    var w = n(i && i.width);
+    if(!w){ var p = prodOf(i); w = p ? n(p.width) : 0; }
+    return w;
+  }
+
+  /* ---------------- حد طول ---------------- */
+  window.lenTh = function(){
+    try{
+      var t = Number(DB.settings && DB.settings.lenThreshold);
+      if(isFinite(t) && t > 0) return t;
+    }catch(e){}
+    return 200;
+  };
+  window.setLenTh = function(v){
+    var t = den(v);
+    if(!(t > 0)){ toast("حد طول باید عددی بزرگ‌تر از صفر باشد."); return; }
+    DB.settings = DB.settings || {};
+    DB.settings.lenThreshold = t;
+    try{ save(); }catch(e){}
+    try{ toast("حد طول روی " + fa(t) + " سانتی‌متر تنظیم شد."); }catch(e){}
+    try{ rerender(); }catch(e){}
+  };
+
+  /* نوار قیمت‌گذاری بر اساس طول، حد را در تنظیمات هم ذخیره کند */
+  if(typeof ssPriceSet === "function"){
+    var _o_sps24 = ssPriceSet;
+    ssPriceSet = function(k, v){
+      var r = _o_sps24.apply(this, arguments);
+      if(k === "threshold"){
+        var t = den(v);
+        if(t > 0){
+          DB.settings = DB.settings || {};
+          DB.settings.lenThreshold = t;
+          try{ save(); }catch(e){}
+        }
+      }
+      return r;
+    };
+  }
+
+  /* ---------------- تفکیک بالا/پایین حد طول ---------------- */
+  window.invLenSplit = function(v){
+    var th = n(v && v.lenThreshold) || lenTh();
+    var mk = function(){ return { sheets:0, meters:0, area:0, amount:0, rows:0, minL:0, maxL:0 }; };
+    var out = { th: th, short: mk(), long: mk(), noLen: mk() };
+    var items = (v && v.items) || [];
+    items.forEach(function(i){
+      var q = n(i.qty), l = itemLen(i), w = itemWidth(i);
+      var amt = q * n(i.price);
+      var t = !l ? out.noLen : (l > th ? out.long : out.short);
+      t.rows++;
+      t.sheets += q;
+      t.meters += l * q / 100;
+      t.area   += w * l * q / 10000;
+      t.amount += amt;
+      if(l){
+        t.minL = t.minL ? Math.min(t.minL, l) : l;
+        t.maxL = Math.max(t.maxL, l);
+      }
+    });
+    ["short","long","noLen"].forEach(function(k){
+      var t = out[k];
+      t.avgPerSheet = t.sheets ? Math.round(t.amount / t.sheets) : 0;
+      t.avgPerM2 = t.area ? Math.round(t.amount / t.area) : 0;
+    });
+    return out;
+  };
+
+  /* ردیف‌های آمار برای سند چاپی */
+  function docSplitStats(v){
+    var s = invLenSplit(v);
+    if(!s.short.sheets && !s.long.sheets) return "";
+    var row = function(label, t){
+      if(!t.sheets) return "";
+      return '<div class="d-stat"><span>' + label + '</span><span class="sv">'
+        + fa(t.sheets) + ' ورق • ' + a1(t.area) + ' m² • ' + money(t.amount) + ' تومان</span></div>';
+    };
+    return row('تا طول ' + fa(s.th) + ' سانتی‌متر', s.short)
+         + row('بالای طول ' + fa(s.th) + ' سانتی‌متر', s.long)
+         + row('بدون طول مشخص', s.noLen);
+  }
+
+  /* کارت تفکیک برای صفحه‌های داخل برنامه */
+  window.lenSplitCard = function(v, title){
+    var s = invLenSplit(v);
+    if(!s.short.sheets && !s.long.sheets && !s.noLen.sheets) return "";
+    var line = function(label, t, cls){
+      if(!t.sheets) return "";
+      return '<div class="sumline"><span>' + label + '</span><b>' + fa(t.sheets) + ' ورق</b></div>'
+        + '<div class="sumline" style="opacity:.75"><span style="padding-right:14px">متراژ / مبلغ</span><span>'
+        + a1(t.area) + ' m² • ' + fa(Math.round(t.meters)) + ' متر طول • ' + money(t.amount) + ' تومان</span></div>';
+    };
+    return '<div class="card" id="len-split-card">'
+      + '<h3>' + (title || 'تفکیک بر اساس حد طول') + '</h3>'
+      + '<div class="notice blue" style="margin-bottom:8px">حد طول: <b>' + fa(s.th) + '</b> سانتی‌متر '
+      + '<button class="btn sm" style="margin-right:8px" onclick="openLenTh()">تغییر حد</button></div>'
+      + line('تا حد طول (' + fa(s.th) + ' سانتی‌متر و کمتر)', s.short)
+      + line('بالای حد طول (بیشتر از ' + fa(s.th) + ' سانتی‌متر)', s.long)
+      + line('بدون طول مشخص', s.noLen)
+      + '</div>';
+  };
+
+  window.openLenTh = function(){
+    openModal('<h3>حد طول برای تفکیک قیمت</h3>'
+      + '<div class="field"><label>طول مرزی (سانتی‌متر)</label>'
+      + '<input id="lt-val" value="' + lenTh() + '" inputmode="numeric"></div>'
+      + '<div class="sub">ورق‌های بلندتر از این عدد در گروه «بالای حد طول» و بقیه در گروه «تا حد طول» شمرده می‌شوند.</div>'
+      + '<div class="actions"><button class="btn" onclick="closeModal()">انصراف</button>'
+      + '<button class="btn primary" onclick="setLenTh(document.getElementById(\'lt-val\').value);closeModal()">ذخیره</button></div>');
+  };
+
+  /* سند چاپی: افزودن تفکیک زیر «متراژ کل» */
+  if(typeof invoiceDocHTML === "function"){
+    var _o_doc24 = invoiceDocHTML;
+    invoiceDocHTML = function(v){
+      var html = _o_doc24.apply(this, arguments);
+      try{
+        var extra = docSplitStats(v);
+        if(extra && typeof html === "string"){
+          html = html.replace(/(<div class="d-stat"><span>متراژ کل<\/span>[\s\S]*?<\/div>)/, "$1" + extra);
+        }
+      }catch(e){}
+      return html;
+    };
+  }
+
+  /* صفحه‌ی فاکتور: کارت تفکیک در انتهای صفحه */
+  if(typeof pageInvoiceDetail === "function"){
+    var _o_pid24 = pageInvoiceDetail;
+    pageInvoiceDetail = function(id){
+      var html = _o_pid24.apply(this, arguments);
+      try{
+        var v = (DB.invoices || []).find(function(x){ return x.id === id; });
+        if(v) html += lenSplitCard(v);
+      }catch(e){}
+      return html;
+    };
+  }
+
+  /* صفحه‌ی صدور فاکتور: تفکیک زنده */
+  if(typeof pageNewInvoice === "function"){
+    var _o_pni24 = pageNewInvoice;
+    pageNewInvoice = function(){
+      var html = _o_pni24.apply(this, arguments);
+      try{
+        if(typeof draft !== "undefined" && draft && (draft.items || []).length){
+          html += lenSplitCard(draft, 'تفکیک حد طول (پیش‌نمایش)');
+        }
+      }catch(e){}
+      return html;
+    };
+  }
+
+  /* ---------------- خرید کارخانه: قیمت بر اساس طول / مترمربع ---------------- */
+  window.PUR_MODES = [
+    ["total", "مبلغ کل (دستی)"],
+    ["len",   "بر اساس طول — تومان به ازای هر متر طول"],
+    ["m2",    "بر اساس مترمربع — تومان به ازای هر مترمربع"],
+    ["sheet", "بر اساس ورق — تومان به ازای هر ورق"]
+  ];
+  window.purModeLabel = function(m){
+    var f = PUR_MODES.find(function(x){ return x[0] === m; });
+    return f ? f[1] : "مبلغ کل";
+  };
+  window.purUnitLabel = function(m){
+    return m === "len" ? "متر طول" : m === "m2" ? "مترمربع" : m === "sheet" ? "ورق" : "";
+  };
+
+  /* جمع ورق/متر/مترمربع برای مجموعه‌ای از ورودی‌های انبار */
+  window.purEntryTotals = function(entries){
+    var t = { sheets:0, meters:0, area:0, rows:0 };
+    (entries || []).forEach(function(e){
+      var p = null;
+      try{ p = getProd(e.productId); }catch(x){}
+      var q = n(e.qty), l = p ? n(p.length) : 0, w = p ? n(p.width) : 0;
+      t.rows++;
+      t.sheets += q;
+      t.meters += l * q / 100;
+      t.area   += w * l * q / 10000;
+    });
+    return t;
+  };
+
+  window.purCalcAmount = function(mode, rate, totals){
+    var r = den(rate), t = totals || {};
+    if(mode === "len")   return Math.round(r * n(t.meters));
+    if(mode === "m2")    return Math.round(r * n(t.area));
+    if(mode === "sheet") return Math.round(r * n(t.sheets));
+    return Math.round(r);
+  };
+
+  /* پخش مبلغ خرید روی ورودی‌ها و به‌روزرسانی قیمت تمام‌شده */
+  window.purApplyCost = function(pur, entries, updateProducts){
+    var mode = pur.priceMode || "total";
+    var rate = n(pur.rate);
+    var tot = purEntryTotals(entries);
+    var total = n(pur.amount);
+    var done = 0;
+    (entries || []).forEach(function(e){
+      var p = null;
+      try{ p = getProd(e.productId); }catch(x){}
+      var q = n(e.qty); if(!q) return;
+      var l = p ? n(p.length) : 0, w = p ? n(p.width) : 0;
+      var per = 0;
+      if(mode === "len" && rate > 0)        per = rate * l / 100;
+      else if(mode === "m2" && rate > 0)    per = rate * w * l / 10000;
+      else if(mode === "sheet" && rate > 0) per = rate;
+      else {
+        /* مبلغ کل: به نسبت مترمربع، در نبود آن به نسبت تعداد */
+        var share = tot.area > 0 ? (w * l * q / 10000) / tot.area : (tot.sheets ? q / tot.sheets : 0);
+        per = q ? (total * share) / q : 0;
+      }
+      per = Math.round(per);
+      if(per > 0){
+        e.buyPrice = per;
+        if(updateProducts !== false && p){ p.costPrice = per; }
+        done++;
+      }
+    });
+    return done;
+  };
+
+  /* ---- افزودن بخش قیمت‌گذاری به فرم خرید دستی ---- */
+  function purPriceBlockHTML(mode, rate, unitQty){
+    var opts = PUR_MODES.map(function(x){
+      return '<option value="' + x[0] + '"' + (x[0] === mode ? ' selected' : '') + '>' + x[1] + '</option>';
+    }).join("");
+    return '<div class="card" id="pu-price-card" style="margin:8px 0">'
+      + '<h3 style="margin-bottom:6px">روش قیمت‌گذاری خرید</h3>'
+      + '<div class="field"><label>محاسبهٔ مبلغ</label>'
+      + '<select id="pu-pmode" onchange="purPriceChanged()">' + opts + '</select></div>'
+      + '<div class="grid2" id="pu-price-inputs">'
+      + '<div class="field"><label>نرخ (تومان)</label><input id="pu-rate" inputmode="numeric" value="' + (rate || "") + '" oninput="purPriceChanged()"></div>'
+      + '<div class="field"><label id="pu-punit-lbl">مقدار</label><input id="pu-punit" inputmode="numeric" value="' + (unitQty || "") + '" oninput="purPriceChanged()"></div>'
+      + '</div>'
+      + '<div class="notice blue" id="pu-price-note">مبلغ محاسبه‌شده: ۰ تومان</div>'
+      + '</div>';
+  }
+
+  window.purPriceChanged = function(){
+    var g = function(id){ var el = document.getElementById(id); return el ? el.value : ""; };
+    var mode = g("pu-pmode") || "total";
+    var rate = den(g("pu-rate"));
+    var unit = den(g("pu-punit"));
+    var sheets = den(g("pu-qty"));
+    var lbl = document.getElementById("pu-punit-lbl");
+    var box = document.getElementById("pu-price-inputs");
+    var amountEl = document.getElementById("pu-amount");
+    var note = document.getElementById("pu-price-note");
+    if(box) box.style.display = (mode === "total") ? "none" : "";
+    if(lbl) lbl.textContent = mode === "len" ? "متر طول کل" : mode === "m2" ? "مترمربع کل" : "تعداد ورق";
+    var unitEl = document.getElementById("pu-punit");
+    if(mode === "sheet" && unitEl && !den(unitEl.value) && sheets) unitEl.value = sheets;
+    var qty = mode === "sheet" ? (den(g("pu-punit")) || sheets) : unit;
+    var amount = mode === "total" ? den(amountEl ? amountEl.value : 0) : Math.round(rate * qty);
+    if(mode !== "total" && amountEl){
+      amountEl.value = amount ? fmt(amount) : "";
+      if(typeof fmtPriceInput === "function"){ try{ fmtPriceInput(amountEl); }catch(e){} }
+    }
+    if(note){
+      note.innerHTML = mode === "total"
+        ? 'مبلغ به‌صورت دستی وارد می‌شود.'
+        : 'مبلغ محاسبه‌شده: <b>' + money(amount) + ' تومان</b> — ' + money(rate) + ' تومان × ' + fa(qty) + ' ' + purUnitLabel(mode);
+    }
+  };
+
+  if(typeof window.openPurchase === "function"){
+    var _o_op24 = window.openPurchase;
+    window.openPurchase = function(id, sid){
+      var r = _o_op24.apply(this, arguments);
+      try{
+        var amountEl = document.getElementById("pu-amount");
+        if(amountEl && !document.getElementById("pu-price-card")){
+          var pur = null;
+          try{ pur = id ? purFind(id) : null; }catch(e){}
+          var holder = amountEl.closest(".field") || amountEl.parentNode;
+          var div = document.createElement("div");
+          div.innerHTML = purPriceBlockHTML(
+            (pur && pur.priceMode) || "total",
+            (pur && pur.rate) ? fmt(pur.rate) : "",
+            (pur && pur.unitQty) ? pur.unitQty : ""
+          );
+          holder.parentNode.insertBefore(div.firstChild, holder);
+          purPriceChanged();
+        }
+      }catch(e){}
+      return r;
+    };
+  }
+
+  if(typeof window.savePurchase === "function"){
+    var _o_sp24 = window.savePurchase;
+    window.savePurchase = function(id){
+      var g = function(x){ var el = document.getElementById(x); return el ? el.value : ""; };
+      var mode = g("pu-pmode") || "total";
+      var rate = den(g("pu-rate"));
+      var unit = den(g("pu-punit"));
+      try{ purPriceChanged(); }catch(e){}
+      var before = ((DB.purchases || []).slice());
+      var r = _o_sp24.apply(this, arguments);
+      try{
+        var pur = id ? purFind(id) : (DB.purchases || []).filter(function(p){
+          return before.indexOf(p) < 0;
+        })[0];
+        if(pur && mode !== "total"){
+          pur.priceMode = mode;
+          pur.rate = rate;
+          pur.unitQty = unit || (mode === "sheet" ? n(pur.qty) : 0);
+          var tag = "قیمت‌گذاری: " + money(rate) + " تومان بر " + purUnitLabel(mode)
+            + " × " + fa(pur.unitQty) + " " + purUnitLabel(mode);
+          pur.note = pur.note ? (pur.note + " — " + tag) : tag;
+          save();
+        }
+      }catch(e){}
+      return r;
+    };
+  }
+
+  /* ---- ثبت خرید از ورق‌هایی که وارد انبار شده‌اند ---- */
+  window.purFreeEntries = function(){
+    return (DB.entries || []).filter(function(e){
+      return !e.purchaseId && !e._deleted && n(e.qty) > 0;
+    }).sort(function(a, b){ return String(b.date).localeCompare(String(a.date)); });
+  };
+
+  window._purPick = {};
+
+  window.openPurchaseFromEntries = function(sid){
+    if(!isManager()){ toast("بخش خرید و کارخانه‌ها فقط برای مدیر است."); return; }
+    supEnsure();
+    var list = purFreeEntries();
+    if(!list.length){ toast("ورودی انبار بدون سند خرید وجود ندارد."); return; }
+    window._purPick = {};
+    list.forEach(function(e){ window._purPick[e.id] = true; });
+    var sups = supList().map(function(s){
+      return '<option value="' + s.id + '"' + (s.id === sid ? ' selected' : '') + '>' + esc(s.name) + '</option>';
+    }).join("");
+    var terms = (window.SUP_TERMS || ["نقدی","چکی","امانی","مدت‌دار","نامشخص"]).map(function(t){
+      return '<option value="' + t + '">' + t + '</option>';
+    }).join("");
+    var modes = PUR_MODES.map(function(x){
+      return '<option value="' + x[0] + '">' + x[1] + '</option>';
+    }).join("");
+    var rows = list.map(function(e){
+      var p = null; try{ p = getProd(e.productId); }catch(x){}
+      var dim = p ? (fa(p.width) + "×" + fa(p.length)) : "—";
+      return '<tr>'
+        + '<td><input type="checkbox" checked onchange="purPickToggle(\'' + e.id + '\',this.checked)"></td>'
+        + '<td>' + esc(e.name || (p ? prodName(p) : "—")) + '<div class="sub">' + dim + ' سانتی‌متر</div></td>'
+        + '<td class="num">' + fa(n(e.qty)) + '</td>'
+        + '<td>' + esc(e.supplier || "—") + '</td>'
+        + '<td>' + (function(){ try{ return faDate(e.date); }catch(x){ return String(e.date || "").slice(0,10); } })() + '</td>'
+        + '</tr>';
+    }).join("");
+    openModal('<h3>ثبت خرید از ورودی‌های انبار</h3>'
+      + '<div class="notice blue">ورق‌هایی که وارد انبار شده‌اند اما هنوز سند خرید ندارند. کارخانه و روش قیمت‌گذاری را انتخاب کنید؛ مبلغ خرید و قیمت تمام‌شده خودکار محاسبه می‌شود.</div>'
+      + '<div class="grid2">'
+      + '<div class="field"><label>کارخانه</label><select id="pe-sup">' + sups + '</select></div>'
+      + '<div class="field"><label>یا نام کارخانهٔ جدید</label><input id="pe-newsup" placeholder="در صورت نیاز"></div>'
+      + '<div class="field"><label>نوع معامله</label><select id="pe-terms">' + terms + '</select></div>'
+      + '<div class="field"><label>تاریخ سند</label><input id="pe-date" placeholder="۱۴۰۵/۰۱/۰۱" value="' + (function(){ try{ var j = isoToJ(todayISO()); return j ? (j[0] + "/" + pad2(j[1]) + "/" + pad2(j[2])) : ""; }catch(x){ return ""; } })() + '"></div>'
+      + '</div>'
+      + '<div class="grid2">'
+      + '<div class="field"><label>روش قیمت‌گذاری</label><select id="pe-mode" onchange="purEntriesCalc()">' + modes + '</select></div>'
+      + '<div class="field"><label id="pe-rate-lbl">نرخ (تومان)</label><input id="pe-rate" inputmode="numeric" oninput="purEntriesCalc()"></div>'
+      + '</div>'
+      + '<label class="chk" style="display:flex;gap:8px;align-items:center;margin:4px 0 8px">'
+      + '<input type="checkbox" id="pe-cost" checked> به‌روزرسانی قیمت خرید و قیمت تمام‌شدهٔ کالاها</label>'
+      + '<div class="notice green" id="pe-sum">—</div>'
+      + '<div class="tblwrap" style="max-height:260px;overflow:auto"><table class="tbl">'
+      + '<thead><tr><th></th><th>کالا</th><th>تعداد</th><th>شرح ورود</th><th>تاریخ</th></tr></thead>'
+      + '<tbody>' + rows + '</tbody></table></div>'
+      + '<div class="actions"><button class="btn" onclick="closeModal()">انصراف</button>'
+      + '<button class="btn primary" onclick="savePurchaseFromEntries()">ثبت سند خرید</button></div>', true);
+    purEntriesCalc();
+  };
+
+  window.purPickToggle = function(id, on){
+    window._purPick[id] = !!on;
+    purEntriesCalc();
+  };
+
+  function pickedEntries(){
+    return purFreeEntries().filter(function(e){ return window._purPick[e.id]; });
+  }
+
+  window.purEntriesCalc = function(){
+    var g = function(id){ var el = document.getElementById(id); return el ? el.value : ""; };
+    var mode = g("pe-mode") || "total";
+    var rate = den(g("pe-rate"));
+    var picked = pickedEntries();
+    var t = purEntryTotals(picked);
+    var amount = purCalcAmount(mode, rate, t);
+    var lbl = document.getElementById("pe-rate-lbl");
+    if(lbl) lbl.textContent = mode === "total" ? "مبلغ کل (تومان)"
+      : mode === "len" ? "نرخ هر متر طول (تومان)"
+      : mode === "m2" ? "نرخ هر مترمربع (تومان)" : "نرخ هر ورق (تومان)";
+    var box = document.getElementById("pe-sum");
+    if(box){
+      box.innerHTML = '<b>' + fa(t.rows) + '</b> ردیف • <b>' + fa(t.sheets) + '</b> ورق • <b>'
+        + a1(t.area) + '</b> مترمربع • <b>' + fa(Math.round(t.meters)) + '</b> متر طول'
+        + '<br>مبلغ سند خرید: <b>' + money(amount) + ' تومان</b>'
+        + (t.sheets ? ' — میانگین هر ورق ' + money(amount / t.sheets) + ' تومان' : '');
+    }
+    return { totals: t, amount: amount, mode: mode, rate: rate, picked: picked };
+  };
+
+  window.savePurchaseFromEntries = function(){
+    var g = function(id){ var el = document.getElementById(id); return el ? el.value : ""; };
+    var c = purEntriesCalc();
+    if(!c.picked.length){ toast("حداقل یک ردیف را انتخاب کنید."); return; }
+    if(!(c.amount > 0)){ toast("نرخ یا مبلغ خرید را وارد کنید."); return; }
+    supEnsure();
+    var newName = String(g("pe-newsup") || "").trim();
+    var s = newName ? supByName(newName, true) : supGet(g("pe-sup"));
+    if(!s){ toast("کارخانه را انتخاب کنید."); return; }
+    var iso = "";
+    try{ iso = jdToISO(g("pe-date")) || todayISO(); }catch(e){ iso = todayISO(); }
+    DB.counters.purchase++;
+    var pur = {
+      id: uid(),
+      number: "P-" + DB.counters.purchase,
+      supplierId: s.id,
+      date: String(iso).slice(0, 10),
+      terms: g("pe-terms") || s.defaultTerms || "نامشخص",
+      dueDate: "",
+      amount: c.amount,
+      qty: c.totals.sheets,
+      priceMode: c.mode,
+      rate: c.rate,
+      unitQty: c.mode === "len" ? Math.round(c.totals.meters) : c.mode === "m2" ? Math.round(c.totals.area) : c.totals.sheets,
+      meters: Math.round(c.totals.meters),
+      area: Math.round(c.totals.area * 100) / 100,
+      note: "از ورودی‌های انبار (" + fa(c.totals.rows) + " ردیف) — "
+        + (c.mode === "total" ? "مبلغ کل دستی"
+          : money(c.rate) + " تومان بر " + purUnitLabel(c.mode)),
+      entryIds: c.picked.map(function(e){ return e.id; }),
+      fromEntries: true,
+      createdBy: (session && session.name) || "",
+      createdAt: new Date().toISOString()
+    };
+    DB.purchases.push(pur);
+    c.picked.forEach(function(e){
+      e.purchaseId = pur.id;
+      e.supplier = s.name;
+    });
+    var updated = purApplyCost(pur, c.picked, document.getElementById("pe-cost") ? document.getElementById("pe-cost").checked : true);
+    save();
+    try{ logAct("accounting", "سند خرید " + pur.number + " از ورودی انبار — " + s.name); }catch(e){}
+    try{ auditLog("purchase_from_entries", pur.number + " — " + money(pur.amount) + " تومان"); }catch(e){}
+    closeModal();
+    try{ rerender(); }catch(e){}
+    toast("سند خرید ثبت شد؛ قیمت خرید " + fa(updated) + " ردیف به‌روزرسانی شد.");
+  };
+
+  /* دکمهٔ میان‌بر در زبانهٔ کارخانه‌ها */
+  if(typeof accSuppliers === "function"){
+    var _o_as24 = accSuppliers;
+    accSuppliers = function(){
+      var html = _o_as24.apply(this, arguments);
+      try{
+        var free = purFreeEntries();
+        var btn = '<div class="card" style="margin-bottom:10px">'
+          + '<h3>ثبت خرید از ورودی‌های انبار</h3>'
+          + '<div class="sub">' + fa(free.length) + ' ردیف ورودی انبار هنوز سند خرید ندارد؛ می‌توانید با نرخ متر طول یا مترمربع برایشان سند خرید بسازید.</div>'
+          + '<div class="actions" style="margin-top:8px"><button class="btn primary" onclick="openPurchaseFromEntries()">ثبت خرید از ورودی‌ها</button></div>'
+          + '</div>';
+        html = btn + html;
+      }catch(e){}
+      return html;
+    };
+  }
+
+  /* تنظیمات: حد طول */
+  if(typeof pageSettings === "function"){
+    var _o_pset24 = pageSettings;
+    pageSettings = function(){
+      var html = _o_pset24.apply(this, arguments);
+      try{
+        if(typeof html === "string" && html.indexOf("len-th-card") < 0 && isManager()){
+          html += '<div class="card" id="len-th-card"><h3>حد طول برای تفکیک قیمت</h3>'
+            + '<div class="sub">در انتهای فاکتور و پیش‌فاکتور، ورق‌ها به دو گروه «تا حد طول» و «بالای حد طول» تفکیک می‌شوند.</div>'
+            + '<div class="field" style="margin-top:8px"><label>طول مرزی (سانتی‌متر)</label>'
+            + '<input id="set-lenth" value="' + lenTh() + '" inputmode="numeric"></div>'
+            + '<div class="actions"><button class="btn primary" onclick="setLenTh(document.getElementById(\'set-lenth\').value)">ذخیره</button></div>'
+            + '</div>';
+        }
+      }catch(e){}
+      return html;
+    };
+  }
+
+})();
+
+
+/* ============== ROUND 25: قیمت خرید پله‌ای طول، ادغام فقط نام برند، ورود گروهی اکسل، پشتیبان، لودینگ ============== */
+(function(){
+
+  function nn(x){ var v = Number(x); return isFinite(v) ? v : 0; }
+  function den(x){ try{ return nn(deNum(x)); }catch(e){ return nn(x); } }
+  function fa(x){ try{ return faNum(x); }catch(e){ return String(x); } }
+  function money(x){ try{ return fmt(Math.round(nn(x))); }catch(e){ return String(Math.round(nn(x))); } }
+  function a1(x){ try{ return area1(x); }catch(e){ return (Math.round(nn(x)*10)/10).toString(); } }
+  function g(id){ return document.getElementById(id); }
+  function gv(id){ var e = g(id); return e ? e.value : ""; }
+  function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+
+  function busyOff(){
+    try{
+      var el = document.getElementById("busy-ov");
+      if(el){ el.classList.remove("on"); el.classList.remove("determinate"); }
+    }catch(e){}
+    try{ _busyDepth = 0; }catch(e){}
+  }
+
+
+  /* =====================================================================
+     ۱) قیمت‌گذاری خرید کارخانه دقیقاً مثل فاکتور مشتری
+     ===================================================================== */
+
+  /* قیمت هر ورق طبق تنظیمات (همان منطق ssResolvePrice/ssLenTier) */
+  window.purSheetPrice = function(p, cfg){
+    var L = nn(p && p.length), W = nn(p && p.width);
+    var area = W * L / 10000, meters = L / 100;
+    var th = nn(cfg.th) || lenTh();
+    var tierRate = (L > th) ? (nn(cfg.longV) || nn(cfg.shortV)) : (nn(cfg.shortV) || nn(cfg.longV));
+    if(cfg.mode === "m2")    return nn(cfg.rate) * area;
+    if(cfg.mode === "sheet") return nn(cfg.rate);
+    if(cfg.mode === "len")   return tierRate * area;
+    if(cfg.mode === "lenm")  return tierRate * meters;
+    return 0;
+  };
+
+  /* محاسبهٔ کامل روی ورودی‌های انبار */
+  window.purPriceEntries = function(entries, cfg){
+    var th = nn(cfg.th) || lenTh();
+    var mk = function(){ return { sheets:0, area:0, meters:0, amount:0, rows:0 }; };
+    var out = { th: th, amount: 0, sheets: 0, area: 0, meters: 0,
+                short: mk(), long: mk(), per: {}, missing: 0 };
+    (entries || []).forEach(function(e){
+      var p = null; try{ p = getProd(e.productId); }catch(x){}
+      var q = nn(e.qty); if(!q) return;
+      if(!p){ out.missing++; return; }
+      var L = nn(p.length), W = nn(p.width);
+      var area = W * L * q / 10000, meters = L * q / 100;
+      var per = Math.round(purSheetPrice(p, cfg));
+      var amt = per * q;
+      var t = (L > th) ? out.long : out.short;
+      t.rows++; t.sheets += q; t.area += area; t.meters += meters; t.amount += amt;
+      out.sheets += q; out.area += area; out.meters += meters; out.amount += amt;
+      out.per[e.id] = per;
+    });
+    return out;
+  };
+
+  /* توزیع مبلغ کل دستی به نسبت مترمربع */
+  function spreadTotal(entries, total){
+    var t = purEntryTotals(entries), per = {};
+    (entries || []).forEach(function(e){
+      var p = null; try{ p = getProd(e.productId); }catch(x){}
+      var q = nn(e.qty); if(!q || !p) return;
+      var area = nn(p.width) * nn(p.length) * q / 10000;
+      var share = t.area > 0 ? area / t.area : (t.sheets ? q / t.sheets : 0);
+      per[e.id] = Math.round((total * share) / q);
+    });
+    return per;
+  }
+
+  window.PUR_MODES = [
+    ["len",   "بر اساس طول — نرخ مترمربع تا حد و بالای حد (مثل فاکتور)"],
+    ["lenm",  "بر اساس طول — نرخ متر طول تا حد و بالای حد"],
+    ["m2",    "نرخ ثابت مترمربع"],
+    ["sheet", "نرخ ثابت هر ورق"],
+    ["total", "مبلغ کل (دستی)"]
+  ];
+
+  function peCfg(){
+    return {
+      mode: gv("pe-mode") || "len",
+      rate: den(gv("pe-rate")),
+      th:   den(gv("pe-th")) || lenTh(),
+      shortV: den(gv("pe-short")),
+      longV:  den(gv("pe-long")),
+      total:  den(gv("pe-total"))
+    };
+  }
+
+  function pickedEntries(){
+    return purFreeEntries().filter(function(e){ return window._purPick[e.id]; });
+  }
+
+  window.purEntriesCalc = function(){
+    var cfg = peCfg();
+    var picked = pickedEntries();
+    var tiered = (cfg.mode === "len" || cfg.mode === "lenm");
+    var single = (cfg.mode === "m2" || cfg.mode === "sheet");
+    var box;
+    box = g("pe-tier-box"); if(box) box.style.display = tiered ? "" : "none";
+    box = g("pe-rate-box");  if(box) box.style.display = single ? "" : "none";
+    box = g("pe-total-box"); if(box) box.style.display = (cfg.mode === "total") ? "" : "none";
+    var lbl = g("pe-rate-lbl");
+    if(lbl) lbl.textContent = cfg.mode === "m2" ? "نرخ هر مترمربع (تومان)" : "نرخ هر ورق (تومان)";
+    var t1 = g("pe-short-lbl"), t2 = g("pe-long-lbl");
+    var unit = cfg.mode === "lenm" ? "متر طول" : "مترمربع";
+    if(t1) t1.textContent = "نرخ تا حد طول (تومان بر " + unit + ")";
+    if(t2) t2.textContent = "نرخ بالای حد طول (تومان بر " + unit + ")";
+
+    var res, per;
+    if(cfg.mode === "total"){
+      var tot = purEntryTotals(picked);
+      per = spreadTotal(picked, cfg.total);
+      res = { th: cfg.th, amount: cfg.total, sheets: tot.sheets, area: tot.area, meters: tot.meters,
+              short: { sheets:0, area:0, meters:0, amount:0 }, long: { sheets:0, area:0, meters:0, amount:0 },
+              per: per, missing: 0, spread: true };
+      picked.forEach(function(e){
+        var p = null; try{ p = getProd(e.productId); }catch(x){}
+        if(!p) return;
+        var q = nn(e.qty), L = nn(p.length);
+        var t = (L > cfg.th) ? res.long : res.short;
+        t.sheets += q;
+        t.area += nn(p.width) * L * q / 10000;
+        t.meters += L * q / 100;
+        t.amount += nn(per[e.id]) * q;
+      });
+    }else{
+      res = purPriceEntries(picked, cfg);
+    }
+    res.cfg = cfg;
+    res.picked = picked;
+
+    var sum = g("pe-sum");
+    if(sum){
+      var line = function(label, t){
+        if(!t.sheets) return "";
+        return '<div class="sumline"><span>' + label + '</span><b>' + fa(t.sheets) + ' ورق • '
+          + a1(t.area) + ' m² • ' + money(t.amount) + ' تومان</b></div>';
+      };
+      sum.innerHTML = '<div class="sumline"><span>مجموع</span><b>' + fa(res.sheets) + ' ورق • '
+        + a1(res.area) + ' m² • ' + fa(Math.round(res.meters)) + ' متر طول</b></div>'
+        + line('تا طول ' + fa(res.th) + ' سانتی‌متر', res.short)
+        + line('بالای طول ' + fa(res.th) + ' سانتی‌متر', res.long)
+        + '<div class="sumline" style="border-top:1px solid var(--bdr);margin-top:6px;padding-top:6px">'
+        + '<span>مبلغ سند خرید</span><b>' + money(res.amount) + ' تومان</b></div>'
+        + (res.sheets ? '<div class="sub">میانگین هر ورق: ' + money(res.amount / res.sheets) + ' تومان</div>' : '')
+        + (res.missing ? '<div class="notice orange">' + fa(res.missing) + ' ردیف کالایش پیدا نشد و محاسبه نشد.</div>' : '');
+    }
+    return res;
+  };
+
+  window.purApplyCost = function(pur, entries, per, updateProducts){
+    var done = 0;
+    (entries || []).forEach(function(e){
+      var v = Math.round(nn(per[e.id]));
+      if(!(v > 0)) return;
+      e.buyPrice = v;
+      if(updateProducts !== false){
+        var p = null; try{ p = getProd(e.productId); }catch(x){}
+        if(p) p.costPrice = v;
+      }
+      done++;
+    });
+    return done;
+  };
+
+  window.openPurchaseFromEntries = function(sid){
+    if(!isManager()){ toast("بخش خرید و کارخانه‌ها فقط برای مدیر است."); return; }
+    supEnsure();
+    var list = purFreeEntries();
+    if(!list.length){ toast("ورودی انبار بدون سند خرید وجود ندارد."); return; }
+    window._purPick = {};
+    list.forEach(function(e){ window._purPick[e.id] = true; });
+    var sups = supList().map(function(s){
+      return '<option value="' + s.id + '"' + (s.id === sid ? ' selected' : '') + '>' + esc(s.name) + '</option>';
+    }).join("");
+    var terms = (window.SUP_TERMS || ["نقدی","چکی","امانی","مدت‌دار","نامشخص"]).map(function(t){
+      return '<option value="' + t + '">' + t + '</option>';
+    }).join("");
+    var modes = PUR_MODES.map(function(x){
+      return '<option value="' + x[0] + '">' + x[1] + '</option>';
+    }).join("");
+    var shelves = {};
+    list.forEach(function(e){
+      var p = null; try{ p = getProd(e.productId); }catch(x){}
+      var sh = p && String(p.shelf || "").trim() ? String(p.shelf).trim() : "بدون قفسه";
+      shelves[sh] = (shelves[sh] || 0) + nn(e.qty);
+    });
+    var shelfChips = Object.keys(shelves).map(function(k){
+      return '<button class="chip" onclick="purPickShelf(\'' + String(k).replace(/'/g, "\\'") + '\')">'
+        + esc(k) + ' (' + fa(shelves[k]) + ')</button>';
+    }).join(" ");
+    var rows = list.map(function(e){
+      var p = null; try{ p = getProd(e.productId); }catch(x){}
+      var dim = p ? (fa(p.width) + "×" + fa(p.length)) : "—";
+      return '<tr>'
+        + '<td><input type="checkbox" id="pe-cb-' + e.id + '" checked onchange="purPickToggle(\'' + e.id + '\',this.checked)"></td>'
+        + '<td>' + esc(e.name || (p ? prodName(p) : "—")) + '<div class="sub">' + dim + ' سانتی‌متر • قفسه: '
+        + esc((p && p.shelf) || "—") + '</div></td>'
+        + '<td class="num">' + fa(nn(e.qty)) + '</td>'
+        + '<td>' + esc(e.supplier || "—") + '</td>'
+        + '<td>' + (function(){ try{ return faDate(e.date); }catch(x){ return String(e.date || "").slice(0,10); } })() + '</td>'
+        + '</tr>';
+    }).join("");
+    var today = "";
+    try{ var j = isoToJ(todayISO()); today = j ? (j[0] + "/" + pad2(j[1]) + "/" + pad2(j[2])) : ""; }catch(x){}
+
+    openModal('<h3>ثبت خرید از ورودی‌های انبار</h3>'
+      + '<div class="notice blue">قیمت‌گذاری دقیقاً مثل فاکتور مشتری: نرخ تا حد طول و نرخ بالای حد طول جداگانه روی مترمربع هر ورق اعمال می‌شود.</div>'
+      + '<div class="grid2">'
+      + '<div class="field"><label>کارخانه</label><select id="pe-sup">' + sups + '</select></div>'
+      + '<div class="field"><label>یا نام کارخانهٔ جدید</label><input id="pe-newsup" placeholder="در صورت نیاز"></div>'
+      + '<div class="field"><label>نوع معامله</label><select id="pe-terms">' + terms + '</select></div>'
+      + '<div class="field"><label>تاریخ سند</label><input id="pe-date" value="' + today + '"></div>'
+      + '</div>'
+      + '<div class="field"><label>روش قیمت‌گذاری</label><select id="pe-mode" onchange="purEntriesCalc()">' + modes + '</select></div>'
+      + '<div id="pe-tier-box"><div class="grid2">'
+      + '<div class="field"><label>حد طول (سانتی‌متر)</label><input id="pe-th" inputmode="numeric" value="' + lenTh() + '" oninput="purEntriesCalc()"></div>'
+      + '<div class="field"><label id="pe-short-lbl">نرخ تا حد طول</label><input id="pe-short" inputmode="numeric" oninput="purEntriesCalc()"></div>'
+      + '<div class="field"><label id="pe-long-lbl">نرخ بالای حد طول</label><input id="pe-long" inputmode="numeric" oninput="purEntriesCalc()"></div>'
+      + '</div></div>'
+      + '<div id="pe-rate-box" style="display:none"><div class="field"><label id="pe-rate-lbl">نرخ</label>'
+      + '<input id="pe-rate" inputmode="numeric" oninput="purEntriesCalc()"></div></div>'
+      + '<div id="pe-total-box" style="display:none"><div class="field"><label>مبلغ کل (تومان)</label>'
+      + '<input id="pe-total" inputmode="numeric" oninput="purEntriesCalc()"></div></div>'
+      + '<label class="chk" style="display:flex;gap:8px;align-items:center;margin:4px 0 8px">'
+      + '<input type="checkbox" id="pe-cost" checked> به‌روزرسانی قیمت خرید و قیمت تمام‌شدهٔ کالاها</label>'
+      + '<div class="notice green" id="pe-sum">—</div>'
+      + (shelfChips ? '<div class="sub" style="margin:6px 0">انتخاب سریع قفسه: ' + shelfChips
+          + ' <button class="chip" onclick="purPickAll(true)">همه</button>'
+          + ' <button class="chip" onclick="purPickAll(false)">هیچ‌کدام</button></div>' : '')
+      + '<div class="tblwrap" style="max-height:240px;overflow:auto"><table class="tbl">'
+      + '<thead><tr><th></th><th>کالا</th><th>تعداد</th><th>شرح ورود</th><th>تاریخ</th></tr></thead>'
+      + '<tbody>' + rows + '</tbody></table></div>'
+      + '<div class="actions"><button class="btn" onclick="closeModal()">انصراف</button>'
+      + '<button class="btn primary" onclick="savePurchaseFromEntries()">ثبت سند خرید</button></div>', true);
+    purEntriesCalc();
+  };
+
+  window.purPickAll = function(on){
+    purFreeEntries().forEach(function(e){
+      window._purPick[e.id] = !!on;
+      var cb = g("pe-cb-" + e.id); if(cb) cb.checked = !!on;
+    });
+    purEntriesCalc();
+  };
+
+  window.purPickShelf = function(name){
+    purFreeEntries().forEach(function(e){
+      var p = null; try{ p = getProd(e.productId); }catch(x){}
+      var sh = p && String(p.shelf || "").trim() ? String(p.shelf).trim() : "بدون قفسه";
+      var on = (sh === name);
+      window._purPick[e.id] = on;
+      var cb = g("pe-cb-" + e.id); if(cb) cb.checked = on;
+    });
+    purEntriesCalc();
+  };
+
+  window.savePurchaseFromEntries = async function(){
+    var c = purEntriesCalc();
+    if(!c.picked.length){ toast("حداقل یک ردیف را انتخاب کنید."); return; }
+    if(!(c.amount > 0)){ toast("نرخ یا مبلغ خرید را وارد کنید."); return; }
+    var newName = String(gv("pe-newsup") || "").trim();
+    var supId = gv("pe-sup"), termsV = gv("pe-terms"), dateV = gv("pe-date");
+    var updCost = g("pe-cost") ? g("pe-cost").checked : true;
+    await withBusy("ثبت سند خرید…", async function(){
+      supEnsure();
+      var s = newName ? supByName(newName, true) : supGet(supId);
+      if(!s){ toast("کارخانه را انتخاب کنید."); return; }
+      var iso = "";
+      try{ iso = jdToISO(dateV) || todayISO(); }catch(e){ iso = todayISO(); }
+      var cfg = c.cfg;
+      var desc = cfg.mode === "len"  ? (money(cfg.shortV) + " / " + money(cfg.longV) + " تومان بر مترمربع (حد " + fa(c.th) + ")")
+               : cfg.mode === "lenm" ? (money(cfg.shortV) + " / " + money(cfg.longV) + " تومان بر متر طول (حد " + fa(c.th) + ")")
+               : cfg.mode === "m2"   ? (money(cfg.rate) + " تومان بر مترمربع")
+               : cfg.mode === "sheet"? (money(cfg.rate) + " تومان بر هر ورق")
+               : "مبلغ کل دستی";
+      DB.counters.purchase++;
+      var pur = {
+        id: uid(), number: "P-" + DB.counters.purchase, supplierId: s.id,
+        date: String(iso).slice(0, 10),
+        terms: termsV || s.defaultTerms || "نامشخص", dueDate: "",
+        amount: Math.round(c.amount), qty: c.sheets,
+        priceMode: cfg.mode, rate: cfg.rate, th: c.th, shortRate: cfg.shortV, longRate: cfg.longV,
+        meters: Math.round(c.meters), area: Math.round(c.area * 100) / 100,
+        tierShort: { sheets: c.short.sheets, area: Math.round(c.short.area * 100) / 100, amount: Math.round(c.short.amount) },
+        tierLong:  { sheets: c.long.sheets,  area: Math.round(c.long.area * 100) / 100,  amount: Math.round(c.long.amount) },
+        note: "از ورودی‌های انبار (" + fa(c.picked.length) + " ردیف) — " + desc,
+        entryIds: c.picked.map(function(e){ return e.id; }),
+        fromEntries: true,
+        createdBy: (session && session.name) || "", createdAt: new Date().toISOString()
+      };
+      DB.purchases.push(pur);
+      c.picked.forEach(function(e){ e.purchaseId = pur.id; e.supplier = s.name; });
+      var updated = purApplyCost(pur, c.picked, c.per, updCost);
+      save();
+      try{ logAct("accounting", "سند خرید " + pur.number + " از ورودی انبار — " + s.name); }catch(e){}
+      try{ auditLog("purchase_from_entries", pur.number + " — " + money(pur.amount) + " تومان"); }catch(e){}
+      closeModal();
+      try{ rerender(); }catch(e){}
+      toast("سند خرید " + pur.number + " ثبت شد — " + money(pur.amount) + " تومان؛ قیمت خرید " + fa(updated) + " ردیف به‌روز شد.");
+    });
+  };
+
+  /* =====================================================================
+     ۲) ادغام برند: فقط یکسان‌سازی نام، بدون دست زدن به قفسه/انبار
+     ===================================================================== */
+  window.bmDedupOn = function(){ var el = g("bm-dedup"); return !!(el && el.checked); };
+
+  try{
+    var _o_omt25 = openMergeTools;
+    openMergeTools = function(){
+      var r = _o_omt25.apply(this, arguments);
+      try{
+        var root = g("modal-root");
+        if(root && root.innerHTML.indexOf("bm-dedup") < 0){
+          var box = document.createElement("div");
+          box.innerHTML = '<div class="notice blue" style="margin-top:10px">'
+            + '<b>ادغام فقط نام برند را یکسان می‌کند.</b> قفسه، انبار، موجودی و قیمت‌ها دست‌نخورده می‌مانند.'
+            + '<label class="chk" style="display:flex;gap:8px;align-items:center;margin-top:8px">'
+            + '<input type="checkbox" id="bm-dedup"> علاوه بر آن، کالاهای کاملاً تکراری هم ادغام شوند '
+            + '<span class="sub">(موجودی دو ردیف یکی می‌شود — پیش‌فرض خاموش)</span></label></div>';
+          var first = root.querySelector(".actions") || root.firstChild;
+          if(first && first.parentNode) first.parentNode.insertBefore(box.firstChild, first);
+          else root.appendChild(box.firstChild);
+        }
+      }catch(e){}
+      return r;
+    };
+  }catch(e){}
+
+  async function bmRunRename(picks, field){
+    var dedup = bmDedupOn();
+    await withBusy("یکسان‌سازی نام…", async function(){
+      var moved = 0;
+      for(var i = 0; i < picks.length; i++){
+        try{ busyStep(picks[i][0] + " ← " + picks[i][1], (i + 1) / picks.length * 80); }catch(e){}
+        moved += bmRename(field, picks[i][0], picks[i][1]);
+        try{ await busyFrame(); }catch(e){}
+      }
+      var removed = 0;
+      if(dedup){
+        try{ busyStep("ادغام کالاهای تکراری…", 90); await busyFrame(); }catch(e){}
+        var r = mergeDupProducts(true);
+        removed = r && r.removed || 0;
+      }
+      if(typeof rebuildIndex === "function") rebuildIndex();
+      save();
+      try{ busyStep("", 100); }catch(e){}
+      closeModal(); render();
+      toast(fa(moved) + " کالا فقط تغییر نام داد"
+        + (removed ? " و " + fa(removed) + " کالای تکراری ادغام شد" : " — قفسه و انبار دست‌نخورده ماند") + ".");
+    });
+  }
+
+  try{
+    bmApplyGroups = async function(){
+      var gs = window._bmGroups || [], field = window._bmField || "brand";
+      var picks = [];
+      gs.forEach(function(grp, i){
+        var cb = g("bmg-" + i);
+        if(!cb || !cb.checked) return;
+        var canon = ((g("bmc-" + i) || {}).value) || grp.names[0];
+        grp.names.forEach(function(nm){ if(nm !== canon) picks.push([nm, canon]); });
+      });
+      if(!picks.length){ toast("موردی انتخاب نشده است."); return; }
+      await bmRunRename(picks, field);
+    };
+    window.bmApplyGroups = bmApplyGroups;
+    brandMergeApply = function(){ return bmApplyGroups(); };
+  }catch(e){}
+
+  try{
+    bmApplyManual = async function(){
+      var field = window._bmField || "brand";
+      var from = gv("bm-from"), to = gv("bm-to");
+      if(!from || !to || from === to){ toast("دو مورد متفاوت انتخاب کنید."); return; }
+      await bmRunRename([[from, to]], field);
+    };
+    window.bmApplyManual = bmApplyManual;
+  }catch(e){}
+
+  /* =====================================================================
+     ۳ و ۶) ورود گروهی اکسل + قفسه‌بندی با نام فایل + رفع گیر خواندن
+     ===================================================================== */
+  function fileBase(nm){
+    return String(nm || "").replace(/\.[^.]+$/, "").replace(/[_]+/g, " ").trim();
+  }
+
+  try{
+    var _o_isf25 = impShelfFor;
+    impShelfFor = function(t){
+      var o = impOpts || {}, m = String(o.shelfMode || "");
+      if(m.indexOf("filename") === 0){
+        var pre = o.shelfPrefix ? o.shelfPrefix + "-" : "";
+        var base = String(window.__impFileBase || "").trim();
+        var color = String(t.color || "").trim() || "بدون رنگ";
+        var brand = String(t.brand || "").trim() || "بدون برند";
+        if(!base) base = "بدون نام";
+        if(m === "filename")      return (pre + base).trim();
+        if(m === "filenamecolor") return (pre + base + " / " + color).trim();
+        if(m === "filenamebrand") return (pre + base + " / " + brand).trim();
+        if(m === "filenamelen")   return (pre + base + " / " + t.l).trim();
+      }
+      return _o_isf25.apply(this, arguments);
+    };
+  }catch(e){}
+
+  window.impHardReset = function(){
+    try{ imp = null; }catch(e){}
+    try{ window.IMPS = { done: 0, total: 0 }; }catch(e){}
+    try{ if(window.IMP21) { IMP21.warn = []; IMP21.read = 0; IMP21.cells = 0; IMP21.addedCols = []; IMP21.seen = {}; } }catch(e){}
+    busyOff();
+    var f = g("imp-file"); if(f){ try{ f.value = ""; }catch(e){} }
+    var b = g("imp-body"); if(b) b.innerHTML = "";
+    var pr = g("imp-prog"); if(pr) pr.style.display = "none";
+  };
+
+  try{
+    var _o_openImport25 = openImport;
+    openImport = function(){
+      try{ imp = null; }catch(e){}
+      try{ window.IMPS = { done: 0, total: 0 }; }catch(e){}
+      busyOff();
+      var r = _o_openImport25.apply(this, arguments);
+      try{
+        var sel = g("imp-shelf-mode");
+        if(sel && sel.innerHTML.indexOf("filename") < 0){
+          var add = [
+            ["filename", "طبق نام فایل اکسل"],
+            ["filenamecolor", "نام فایل + رنگ"],
+            ["filenamebrand", "نام فایل + برند"],
+            ["filenamelen", "نام فایل + طول"]
+          ];
+          add.forEach(function(x){
+            var op = document.createElement("option");
+            op.value = x[0]; op.textContent = x[1];
+            sel.insertBefore(op, sel.firstChild);
+          });
+          sel.value = "file";
+        }
+        var f = g("imp-file");
+        if(f){
+          f.multiple = true;
+          f.value = "";
+          if(!g("imp-multi-note")){
+            var note = document.createElement("div");
+            note.id = "imp-multi-note";
+            note.className = "sub";
+            note.innerHTML = "می‌توانید چند فایل را با هم انتخاب کنید؛ با حالت «طبق نام فایل اکسل» هر فایل در قفسهٔ هم‌نام خودش قرار می‌گیرد. "
+              + '<button class="btn sm" onclick="impHardReset()">بازنشانی خواننده</button>';
+            f.parentNode.insertBefore(note, f.nextSibling);
+          }
+        }
+      }catch(e){}
+      return r;
+    };
+    window.openImport = openImport;
+  }catch(e){}
+
+  function impItemsCount(){
+    try{ return (imp && imp.items) ? imp.items.length : 0; }catch(e){ return 0; }
+  }
+
+  async function impCommitWait(){
+    var p = null;
+    try{ p = impCommit(); }catch(e){ throw e; }
+    if(p && typeof p.then === "function"){ try{ await p; }catch(e){} }
+    for(var i = 0; i < 900; i++){
+      var s = window.IMPS || null;
+      var running = s && s.total > 0 && s.done < s.total;
+      var pr = g("imp-prog");
+      var visible = pr && pr.style.display !== "none";
+      if(!running && !visible) break;
+      await sleep(200);
+    }
+    await sleep(500);
+  }
+
+  function ensureImportUI(saved){
+    if(g("imp-body")) return;
+    openImport();
+    var s = saved || {};
+    if(g("imp-wh")) g("imp-wh").value = s.wh || "file";
+    if(g("imp-shelf-mode")) g("imp-shelf-mode").value = s.shelfMode || "file";
+    try{ impShelfUI(); }catch(e){}
+    if(g("imp-shelf-prefix")) g("imp-shelf-prefix").value = s.shelfPrefix || "";
+    if(g("imp-shelf-fixed")) g("imp-shelf-fixed").value = s.shelfFixed || "";
+    if(g("imp-shelf-force")) g("imp-shelf-force").checked = !!s.force;
+    try{ impReadOpts(); }catch(e){}
+  }
+
+  window.impMultiRun = async function(files){
+    var saved = {};
+    try{ saved = JSON.parse(JSON.stringify(impReadOpts())); }catch(e){}
+    var report = [];
+    for(var i = 0; i < files.length; i++){
+      var f = files[i];
+      window.__impFileBase = fileBase(f.name);
+      ensureImportUI(saved);
+      var body = g("imp-body");
+      if(body){
+        body.innerHTML = '<div class="notice blue">در حال خواندن فایل '
+          + fa(i + 1) + ' از ' + fa(files.length) + ': <b>' + esc(f.name) + '</b>…</div>';
+      }
+      await sleep(60);
+      try{
+        await _o_impRead25({ files: [f] });
+      }catch(e){
+        report.push({ name: f.name, ok: false, msg: (e && e.message) || "خطای خواندن" });
+        continue;
+      }
+      if(!impItemsCount()){
+        report.push({ name: f.name, ok: false, msg: "ردیف قابل ورود پیدا نشد" });
+        continue;
+      }
+      var sheets = 0;
+      try{ imp.items.forEach(function(t){ sheets += nn(t.sq) + nn(t.sj); }); }catch(e){}
+      var rowsN = impItemsCount();
+      try{ impReadOpts(); }catch(e){}
+      try{
+        await impCommitWait();
+        report.push({ name: f.name, ok: true, rows: rowsN, sheets: sheets, shelf: window.__impFileBase });
+      }catch(e){
+        report.push({ name: f.name, ok: false, msg: (e && e.message) || "خطا در ثبت" });
+      }
+    }
+    window.__impFileBase = "";
+    ensureImportUI(saved);
+    var okN = report.filter(function(r){ return r.ok; }).length;
+    var totalSheets = report.reduce(function(a, r){ return a + (r.ok ? nn(r.sheets) : 0); }, 0);
+    var b2 = g("imp-body");
+    if(b2){
+      b2.innerHTML = '<div class="notice green"><b>ورود گروهی پایان یافت:</b> '
+        + fa(okN) + ' از ' + fa(files.length) + ' فایل — مجموع ' + fa(totalSheets) + ' ورق</div>'
+        + '<div class="tblwrap"><table class="tbl"><thead><tr><th>فایل</th><th>وضعیت</th><th>ردیف</th><th>ورق</th><th>قفسه</th></tr></thead><tbody>'
+        + report.map(function(r){
+            return '<tr><td>' + esc(r.name) + '</td><td>'
+              + (r.ok ? '<span class="badge green">ثبت شد</span>' : '<span class="badge red">' + esc(r.msg || "خطا") + '</span>')
+              + '</td><td class="num">' + (r.ok ? fa(r.rows) : "—") + '</td><td class="num">'
+              + (r.ok ? fa(r.sheets) : "—") + '</td><td>' + esc(r.shelf || "—") + '</td></tr>';
+          }).join("")
+        + '</tbody></table></div>';
+    }
+    try{ toast(fa(okN) + " فایل اکسل وارد انبار شد — " + fa(totalSheets) + " ورق."); }catch(e){}
+    return report;
+  };
+
+  var _o_impRead25 = null;
+  try{
+    _o_impRead25 = impRead;
+    impRead = async function(inp){
+      var files = [];
+      try{ files = inp && inp.files ? Array.prototype.slice.call(inp.files) : []; }catch(e){}
+      if(!files.length) return;
+      try{
+        if(files.length > 1){
+          return await impMultiRun(files);
+        }
+        window.__impFileBase = fileBase(files[0].name);
+        return await _o_impRead25.call(this, inp);
+      }catch(e){
+        var b = g("imp-body");
+        if(b) b.innerHTML = '<div class="notice red">خطا در خواندن فایل: ' + esc((e && e.message) || "نامشخص")
+          + '<br>دکمهٔ «بازنشانی خواننده» را بزنید و دوباره امتحان کنید.</div>';
+        try{ toast("خواندن فایل ممکن نشد."); }catch(x){}
+      }finally{
+        if(files.length > 1) busyOff();
+        try{ if(inp && inp.value !== undefined) inp.value = ""; }catch(x){}
+      }
+    };
+    window.impRead = impRead;
+  }catch(e){}
+
+  /* =====================================================================
+     ۴) بازیابی فایل پشتیبان — خواندن مطمئن
+     ===================================================================== */
+  window._bkText = "";
+
+  window.bkPeek = function(txt){
+    var j = null;
+    try{ j = JSON.parse(txt); }catch(e){ return { ok: false, msg: "متن فایل JSON معتبر نیست." }; }
+    var db = null;
+    if(j && j.db && Array.isArray(j.db.products)) db = j.db;
+    else if(j && Array.isArray(j.products)) db = j;
+    else if(j && j.data && Array.isArray(j.data.products)) db = j.data;
+    else if(j && j.DB && Array.isArray(j.DB.products)) db = j.DB;
+    if(!db) return { ok: false, msg: "ساختار فایل پشتیبان شناخته نشد (فهرست کالاها پیدا نشد)." };
+    return {
+      ok: true, db: db,
+      products: db.products.length,
+      customers: (db.customers || []).length,
+      invoices: (db.invoices || []).length,
+      payments: (db.payments || []).length,
+      sheets: (db.products || []).reduce(function(a, p){
+        var s = p.stock || {}; return a + nn(s.qom) + nn(s.jaf);
+      }, 0)
+    };
+  };
+
+  window.bkFile = async function(inp){
+    var f = inp && inp.files && inp.files[0];
+    if(!f) return;
+    var info = g("bk-info");
+    if(info) info.innerHTML = '<span class="sub">در حال خواندن ' + esc(f.name) + '…</span>';
+    try{
+      var txt = "";
+      try{ txt = await f.text(); }
+      catch(e){
+        txt = await new Promise(function(res, rej){
+          var r = new FileReader();
+          r.onload = function(){ res(String(r.result || "")); };
+          r.onerror = function(){ rej(new Error("خواندن فایل ممکن نشد")); };
+          r.readAsText(f);
+        });
+      }
+      window._bkText = txt;
+      var peek = bkPeek(txt);
+      if(!peek.ok){
+        if(info) info.innerHTML = '<div class="notice red">' + esc(peek.msg) + '</div>';
+        return;
+      }
+      if(info){
+        info.innerHTML = '<div class="notice green"><b>' + esc(f.name) + '</b> خوانده شد — '
+          + fa(peek.products) + ' کالا (' + fa(peek.sheets) + ' ورق)، '
+          + fa(peek.customers) + ' مشتری، ' + fa(peek.invoices) + ' فاکتور، '
+          + fa(peek.payments) + ' پرداخت.<br>دکمهٔ «بازیابی اطلاعات» را بزنید.</div>';
+      }
+      var ta = g("bk-text");
+      if(ta){
+        if(txt.length > 400000){
+          ta.value = "";
+          ta.placeholder = "فایل حجیم است و در حافظه نگه داشته شد؛ نیازی به نمایش متن نیست.";
+        }else{
+          ta.value = txt;
+        }
+      }
+    }catch(e){
+      if(info) info.innerHTML = '<div class="notice red">خطا در خواندن فایل: ' + esc((e && e.message) || "نامشخص") + '</div>';
+    }finally{
+      try{ if(inp) inp.value = ""; }catch(x){}
+    }
+  };
+
+  window.bkApplyText = async function(){
+    var ta = g("bk-text");
+    var txt = String(window._bkText || (ta ? ta.value : "") || "").trim();
+    if(!txt){ toast("ابتدا فایل پشتیبان را انتخاب یا متن آن را پیست کنید."); return; }
+    var peek = bkPeek(txt);
+    if(!peek.ok){ toast(peek.msg); return; }
+    var ok = await applyBackup(txt, "");
+    if(ok){ window._bkText = ""; closeModal(); }
+  };
+
+  /* بازیابی مقاوم‌شده: ساختارهای بیشتر + پیام خطای روشن + لودینگ */
+  try{
+    var _o_applyBackup25 = applyBackup;
+    applyBackup = async function(text, name){
+      var peek = bkPeek(String(text || ""));
+      if(!peek.ok){ toast(peek.msg); return false; }
+      var db = peek.db;
+      if(!Array.isArray(db.customers) || !Array.isArray(db.invoices)){
+        var wrapped = JSON.stringify({ app: "composite-sales", version: 5, db: db });
+        db.customers = db.customers || [];
+        db.invoices = db.invoices || [];
+        text = wrapped;
+      }
+      if(!await uiConfirm("همهٔ اطلاعات فعلی با فایل پشتیبان جایگزین می‌شود ("
+        + fa(peek.products) + " کالا، " + fa(peek.invoices) + " فاکتور). ادامه می‌دهید؟")) return false;
+      var okRes = false;
+      await withBusy("بازیابی اطلاعات از پشتیبان…", async function(){
+        try{ busyStep("آماده‌سازی…", 20); await busyFrame(); }catch(e){}
+        var full = peek.db;
+        full.cards = full.cards || []; full.activity = full.activity || [];
+        full.payments = full.payments || []; full.counters = full.counters || DB.counters;
+        full.truckHistory = full.truckHistory || []; full.stocktaking = full.stocktaking || [];
+        full.auditLog = full.auditLog || []; full.roles = full.roles || [];
+        full.brandMemory = full.brandMemory || {}; full.entries = full.entries || [];
+        full.settings = full.settings || (DB.settings || {});
+        try{ busyStep("جایگزینی داده‌ها…", 60); await busyFrame(); }catch(e){}
+        DB = full;
+        try{ if(typeof rebuildIndex === "function") rebuildIndex(); }catch(e){}
+        try{ logAct("backup", "بازیابی فایل پشتیبان" + (name ? " (" + name + ")" : "")); }catch(e){}
+        try{ busyStep("ذخیره…", 85); await busyFrame(); }catch(e){}
+        try{ save(); }
+        catch(e){
+          toast("داده‌ها بازیابی شد اما ذخیره در حافظهٔ مرورگر ناموفق بود (حجم زیاد).");
+        }
+        try{ render(); }catch(e){}
+        try{ busyStep("", 100); }catch(e){}
+        okRes = true;
+        toast("اطلاعات بازیابی شد: " + fa(peek.products) + " کالا، "
+          + fa(peek.customers) + " مشتری، " + fa(peek.invoices) + " فاکتور.");
+      });
+      return okRes;
+    };
+    window.applyBackup = applyBackup;
+  }catch(e){}
+
+  /* =====================================================================
+     ۵) نمایشگر لودینگ برای عملیات سنگین
+     ===================================================================== */
+  try{
+    var _o_saveInvoice25 = saveInvoice;
+    saveInvoice = async function(){
+      var self = this, args = arguments, out;
+      await withBusy("ثبت سند…", async function(){
+        out = await _o_saveInvoice25.apply(self, args);
+      });
+      return out;
+    };
+    window.saveInvoice = saveInvoice;
+  }catch(e){}
+
+  try{
+    var _o_mdp25 = mergeDupProducts;
+    mergeDupProducts = function(silent){ return _o_mdp25.apply(this, arguments); };
+  }catch(e){}
+
+  try{
+    var _o_stk25 = applyStocktaking;
+    applyStocktaking = async function(id){
+      var self = this, args = arguments, out;
+      await withBusy("اعمال انبارگردانی…", async function(){
+        out = await _o_stk25.apply(self, args);
+      });
+      return out;
+    };
+    window.applyStocktaking = applyStocktaking;
+  }catch(e){}
+
+  try{
+    var _o_savePay25 = savePayment;
+    savePayment = async function(){
+      var self = this, args = arguments, out;
+      await withBusy("ثبت دریافت…", async function(){
+        out = await _o_savePay25.apply(self, args);
+      });
+      return out;
+    };
+    window.savePayment = savePayment;
+  }catch(e){}
+
+})();
+
 </script>
 </body>
 </html>
