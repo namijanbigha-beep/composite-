@@ -4164,7 +4164,7 @@ function invoiceDocHTML(v,withStmt){
     <div class="d-sum-sec">
       <div class="d-sum-top">
         <div class="d-stats">
-          <div class="d-stat"><span>تعداد کل اقلام</span><span class="sv">${faNum(v.items.length)}</span></div>
+          
           <div class="d-stat"><span>تعداد کل ورق</span><span class="sv">${fmt(invQty(v))}</span></div>
           <div class="d-stat"><span>متراژ کل</span><span class="sv">${area1(invArea(v))} m²</span></div>
         </div>
@@ -6791,7 +6791,7 @@ function impProgressHTML(total){
     <div style="height:12px;background:var(--md-outline-variant,#e0e0e0);border-radius:8px;overflow:hidden;margin:10px 0 6px">
       <div id="imp-prog-bar" style="height:100%;width:0%;background:var(--md-primary,#2783DE);transition:width .12s linear"></div>
     </div>
-    <div class="sub" id="imp-prog-sub">۰ از ${faNum(total)} ردیف — لطفاً پنجره را نبندید.</div>
+    <div class="sub" id="imp-prog-sub">۰ از ${faNum((window.IMPS&&window.IMPS.total)||0)} ورق — لطفاً پنجره را نبندید.</div>
   </div>`;
 }
 function impSetProgress(done,total,extra){
@@ -6799,7 +6799,7 @@ function impSetProgress(done,total,extra){
   const bar=document.getElementById("imp-prog-bar"),txt=document.getElementById("imp-prog-txt"),sub=document.getElementById("imp-prog-sub");
   if(bar)bar.style.width=pct+"%";
   if(txt)txt.textContent="در حال ثبت کالاها… "+faNum(pct)+"٪";
-  if(sub)sub.textContent=faNum(done)+" از "+faNum(total)+" ردیف"+(extra?" — "+extra:"")+" — لطفاً پنجره را نبندید.";
+  if(sub){const _S=window.IMPS||null;const _txt=_S?(faNum(_S.done)+" از "+faNum(_S.total)+" ورق ("+faNum(done)+" از "+faNum(total)+" ردیف)"):(faNum(done)+" از "+faNum(total)+" ردیف");sub.textContent=_txt+(extra?" — "+extra:"")+" — لطفاً پنجره را نبندید.";}
 }
 function impCommit(){
   if(!imp||imp._running)return;
@@ -6810,20 +6810,22 @@ function impCommit(){
   imp.items.forEach(t=>tasks.push({kind:"new",t}));
   imp.dups.forEach(t=>tasks.push({kind:"dup",t}));
   const total=tasks.length;
+  const _qtyOf=t=>impPlan(t).reduce((s,x)=>s+(x[1]>0?x[1]:0),0);
+  window.IMPS={done:0,total:tasks.reduce((s,k)=>s+((k.kind==="new"||k.t.action==="merge"||k.t.action==="replace")?_qtyOf(k.t):0),0)};
   const errs=imp.errors.slice();
-  const st={added:0,merged:0,replaced:0,skipped:0,failed:0};
+  const st={added:0,merged:0,replaced:0,skipped:0,failed:0,sheets:0,sheetsDup:0,split:0,kept:[]};
   const failMsgs=[];
   const shelfCount=new Map();
   const byId=new Map((DB.products||[]).map(p=>[p.id,p]));
   const body=document.querySelector("#imp-body");
   if(body)body.innerHTML=impProgressHTML(total);
-  const markShelf=n=>{if(n)shelfCount.set(n,(shelfCount.get(n)||0)+1)};
+  const markShelf=(n,q)=>{if(n)shelfCount.set(n,(shelfCount.get(n)||0)+(Number(q)||0))};
   const doNew=t=>{
     const shelf=impShelfFor(t);
     const p={id:uid(),brand:t.brand,thickness:t.th,color:t.color,width:t.w,length:t.l,stock:{qom:0,jaf:0},minStock:t.minSt,costPrice:0,salePrice:t.sale,minPrice:t.minp,shelf:shelf||""};
     DB.products.push(p);byId.set(p.id,p);
     if(!(p.minPrice>0))pmAdd(p.id);
-    markShelf(p.shelf);
+    const _q=_qtyOf(t);markShelf(p.shelf,_q);st.sheets+=_q;window.IMPS.done+=_q;
     impPlan(t).forEach(([wh,qn])=>{
       if(qn>0){
         InventoryEngine.receive({ productId: p.id, warehouseId: wh, quantity: qn, referenceType: 'xlsx_import', referenceId: '', reason: 'ورود از اکسل' });
@@ -6837,9 +6839,13 @@ function impCommit(){
     const p=byId.get(t.exId);
     if(!p){st.skipped++;return}
     const plan=impPlan(t);
+    const _q=plan.reduce((s,x)=>s+(x[1]>0?x[1]:0),0);
     const applyShelf=()=>{
       const sh=impShelfFor(t);
-      if(sh&&(impOpts.force||!String(p.shelf||"").trim())){p.shelf=sh;markShelf(sh)}
+      const cur=String(p.shelf||"").trim();
+      if(!sh){markShelf(cur,_q);return}
+      if(!cur||impOpts.force){p.shelf=sh;markShelf(sh,_q);return}
+      markShelf(cur,_q);
     };
     if(t.action==="replace"){
       plan.forEach(([wh,qn])=>{
@@ -6850,12 +6856,25 @@ function impCommit(){
       p.minStock=t.minSt;p.salePrice=t.sale;p.minPrice=t.minp;
       applyShelf();
       if(!(p.minPrice>0))pmAdd(p.id);
+      st.sheetsDup+=_q;window.IMPS.done+=_q;
       st.replaced++;
     }else if(t.action==="merge"){
+      const _sh=impShelfFor(t),_cur=String(p.shelf||"").trim();
+      if(_sh&&_cur&&_cur!==_sh&&!impOpts.force){
+        /* همین کالا از قبل روی قفسهٔ دیگری است — ردیف جدا برای قفسهٔ جدید تا ورق‌های قبلی جابه‌جا نشوند */
+        const np={id:uid(),brand:p.brand,thickness:p.thickness,color:p.color,width:p.width,length:p.length,stock:{qom:0,jaf:0},minStock:t.minSt||p.minStock||0,costPrice:p.costPrice||0,salePrice:t.sale||p.salePrice||0,minPrice:t.minp||p.minPrice||0,shelf:_sh};
+        DB.products.push(np);byId.set(np.id,np);
+        if(!(np.minPrice>0))pmAdd(np.id);
+        plan.forEach(([wh,qn])=>{if(qn>0){InventoryEngine.receive({ productId: np.id, warehouseId: wh, quantity: qn, referenceType: 'xlsx_import', referenceId: '', reason: 'ورود از اکسل - قفسهٔ جدید' });DB.counters.entry++;DB.entries.push({id:uid(),number:"I-"+DB.counters.entry,productId:np.id,name:prodName(np),qty:qn,buyPrice:0,shippingTotal:0,supplier:"ورود از اکسل",wh,date:todayISO(),note:"ورود از اکسل — قفسه "+_sh})}});
+        markShelf(_sh,_q);st.sheets+=_q;st.split++;window.IMPS.done+=_q;
+        if(st.kept.length<200)st.kept.push({name:prodName(np),cur:_cur,want:_sh,q:_q});
+        st.merged++;return;
+      }
       plan.forEach(([wh,qn])=>{if(qn>0)InventoryEngine.receive({ productId: p.id, warehouseId: wh, quantity: qn, referenceType: 'xlsx_import', referenceId: '', reason: 'ورود از اکسل - ادغام' })});
       if(t.sale)p.salePrice=t.sale;
       if(t.minp)p.minPrice=t.minp;
       applyShelf();
+      st.sheetsDup+=_q;window.IMPS.done+=_q;
       st.merged++;
     }else st.skipped++;
   };
@@ -6868,11 +6887,12 @@ function impCommit(){
     imp=null;
     render();
     openModal(`<h3>گزارش ورود از اکسل</h3>
-    <div class="pc-stocks" style="margin:12px 0"><div><span>ثبت‌شده</span><b class="num">${faNum(st.added)}</b></div><div><span>ویرایش/جایگزین</span><b class="num">${faNum(st.merged+st.replaced)}</b></div><div><span>خطا</span><b class="num">${faNum(errs.length+st.failed)}</b></div><div class="tot"><span>تکراری ردشده</span><b class="num">${faNum(st.skipped)}</b></div></div>
+    <div class="pc-stocks" style="margin:12px 0"><div><span>ورق ثبت‌شده</span><b class="num">${faNum(st.sheets+st.sheetsDup)}</b></div><div><span>ردیف کالای جدید</span><b class="num">${faNum(st.added)}</b></div><div><span>ویرایش/جایگزین</span><b class="num">${faNum(st.merged+st.replaced)}</b></div><div class="tot"><span>خطا</span><b class="num">${faNum(errs.length+st.failed)}</b></div></div><div class="sub">تکراری ردشده: <b>${faNum(st.skipped)}</b></div>
     <div class="sub">انبار مقصد: <b>${esc(whLabel)}</b></div>
-    ${shelfLines.length?`<div class="sub" style="margin:10px 0 4px">قفسه‌بندی انجام‌شده:</div><div style="max-height:170px;overflow:auto">${shelfLines.map(([n,c])=>`<div class="sumline"><span>${esc(n)}</span><b class="num">${faNum(c)} کالا</b></div>`).join("")}</div>`:""}
+    ${shelfLines.length?`<div class="sub" style="margin:10px 0 4px">قفسه‌بندی انجام‌شده:</div><div style="max-height:170px;overflow:auto">${shelfLines.map(([n,c])=>`<div class="sumline"><span>${esc(n)}</span><b class="num">${faNum(c)} ورق</b></div>`).join("")}</div>`:""}
     ${!ok?'<div class="notice red">⚠️ ذخیره‌سازی در حافظه مرورگر ناموفق بود؛ حجم داده‌ها بیش از ظرفیت است. از داده‌ها خروجی پشتیبان بگیرید.</div>':""}
     ${(errs.length||failMsgs.length)?`<div class="notice red" style="max-height:180px;overflow:auto">${errs.slice(0,50).map(e=>`ردیف ${faNum(e.n)}: ${e.msg}`).concat(failMsgs).join("<br>")}</div>`:""}
+    ${st.kept.length?`<div class="notice blue" style="max-height:170px;overflow:auto"><b>قفسهٔ موجودی قبلی دست‌نخورده ماند</b> — برای ${faNum(st.split)} کالا ردیف جداگانه در قفسهٔ جدید ساخته شد:<br>${st.kept.slice(0,20).map(k=>`${esc(k.name)} — ${faNum(k.q)} ورق در «${esc(k.want)}» ثبت شد؛ موجودی قبلی در «${esc(k.cur)}» ماند`).join("<br>")}${st.kept.length>20?`<br>و ${faNum(st.kept.length-20)} مورد دیگر…`:""}</div>`:""}
     <div class="actions"><button class="btn primary" onclick="closeModal()">باشه</button><button class="btn" onclick="closeModal();go('shelfReport')">مشاهده قفسه‌بندی</button></div>`,true);
   };
   const step=()=>{
@@ -9513,7 +9533,7 @@ function pageCustomerCatalog(){
     <div class="cat6-stats">
       <div class="cat6-stat"><div class="cs-label">برند</div><div class="cs-value">${faNum(totalBrands)}</div></div>
       <div class="cat6-stat"><div class="cs-label">رنگ</div><div class="cs-value">${faNum(totalColors)}</div></div>
-      <div class="cat6-stat"><div class="cs-label">کل اقلام</div><div class="cs-value">${faNum(totalProducts)}</div></div>
+      
     </div>
     
     <div id="cat6-grid">${brandsHTML||`<div class="cat6-empty">
@@ -14381,6 +14401,1771 @@ syncConnect=async function(){
     :'\u0627\u0631\u0633\u0627\u0644 \u0628\u0647 \u0633\u0631\u0648\u0631 \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0648\u062f');
   return ok;
 };
+
+
+/* ====== ROUND 16: ستون اول ماتریس هم یک برند است ====== */
+var IMP21={warn:[],read:0,cells:0,addedCols:[],seen:{}};
+function imp21Cell(r,i){return String((r&&r[i]!=null?r[i]:'')).trim()}
+function imp21Num(v){
+  var s=latinDigits(String(v||'')).replace(/[^0-9.\-]/g,'');
+  if(s==='')return NaN;
+  return Number(s);
+}
+function imp21IsLen(v){
+  var n=imp21Num(v);
+  return !!(n&&!isNaN(n)&&Math.abs(n-Math.round(n))<1e-9&&n>=50&&n<=2000);
+}
+function imp21HeaderRow(rows){
+  var i;
+  for(i=0;i<Math.min(rows.length,8);i++){
+    if(imp21Cell(rows[i],0).indexOf('\u0631\u062f\u06cc\u0641')>=0)return i;
+  }
+  for(i=0;i<Math.min(rows.length,8);i++){
+    var r=rows[i]||[],labels=0;
+    for(var c=1;c<r.length;c++){
+      var v=imp21Cell(r,c);
+      if(v&&isNaN(imp21Num(v)))labels++;
+    }
+    if(labels>=2)return i;
+  }
+  return -1;
+}
+/* نام برند ستون اول را از سرستون یا از ردیف‌های عنوان بالای آن پیدا کن */
+function imp21BrandOfFirstCol(rows,hi,knownBrands){
+  var BAD=/\u0631\u062f\u06cc\u0641|\u0637\u0648\u0644|\u0639\u0631\u0636|\u0633\u0627\u0646\u062a\u06cc|\u0645\u062a\u0631|\u062c\u0645\u0639|\u0634\u0645\u0627\u0631\u0647|\u0627\u0628\u0639\u0627\u062f|\u0645\u0648\u062c\u0648\u062f\u06cc|\u0644\u06cc\u0633\u062a|\u0627\u0646\u0628\u0627\u0631|\u06af\u0632\u0627\u0631\u0634|\u062a\u0627\u0631\u06cc\u062e|\u06a9\u0627\u0645\u067e\u0648\u0632\u06cc\u062a|\u0631\u0646\u06af|\u06a9\u062f/;
+  var h=imp21Cell(rows[hi],0);
+  if(h&&isNaN(imp21Num(h))&&!BAD.test(h))return h;
+  for(var i=hi-1;i>=0;i--){
+    var row=rows[i]||[];
+    var filled=[];
+    for(var c=0;c<row.length;c++){var v=imp21Cell(row,c);if(v)filled.push(v)}
+    if(!filled.length)continue;
+    var t=filled[0];
+    /* عنوان ادغام‌شدهٔ بالای جدول: فقط یک متن دارد */
+    if(filled.length<=2&&t&&isNaN(imp21Num(t))&&t.length<=30&&!BAD.test(t))return t;
+  }
+  /* اگر نام پیدا نشد اما داده هست، داده را حداقل با نام نامشخص بیاور */
+  return null;
+}
+function imp21Shift(rows){
+  if(!rows||rows.length<2)return null;
+  var hi=imp21HeaderRow(rows);
+  if(hi<0)return null;
+  var nums=0,txts=0,vals=[];
+  for(var ri=hi+1;ri<rows.length;ri++){
+    var v=imp21Cell(rows[ri],0);
+    if(!v)continue;
+    if(/\u0633\u0627\u0646\u062a\u06cc|\u0645\u062a\u0631|\u062c\u0645\u0639/.test(v))continue;
+    if(imp21IsLen(v)){nums++;vals.push(Math.round(imp21Num(v)))}else txts++;
+  }
+  if(nums<3)return null;                       /* ستون برچسب است، دست نزن */
+  if(nums<(nums+txts)*0.6)return null;
+  var seq=true;
+  for(var i=1;i<vals.length;i++){if(vals[i]!==vals[i-1]+1){seq=false;break}}
+  if(seq&&vals.length>2&&vals[0]<=2)return null; /* شمارهٔ ردیف */
+  var brand=imp21BrandOfFirstCol(rows,hi,null);
+  var named=!!brand;
+  if(!brand)brand='\u0646\u0627\u0645\u0634\u062e\u0635';
+  var out=[];
+  for(var r=0;r<rows.length;r++){
+    var src=rows[r]||[];
+    out.push([''].concat(src.slice()));
+  }
+  out[hi][1]=brand;
+  /* عنوان‌های بالای سرستون را پاک کن تا ردیف داده حساب نشوند */
+  for(var q=0;q<hi;q++)out[q]=[''];
+  var _ak=brand+'#'+nums;
+  if(!IMP21.seen)IMP21.seen={};
+  if(!IMP21.seen['col:'+_ak]){IMP21.seen['col:'+_ak]=1;IMP21.addedCols.push({brand:brand,cells:nums,named:named});}
+  if(!named)IMP21.warn.push('\u0633\u062a\u0648\u0646 \u0627\u0648\u0644 \u0641\u0627\u06cc\u0644 \u0646\u0627\u0645 \u0628\u0631\u0646\u062f \u0646\u062f\u0627\u0634\u062a \u0648 \u0628\u0627 \u0646\u0627\u0645 \u00ab\u0646\u0627\u0645\u0634\u062e\u0635\u00bb \u0648\u0627\u0631\u062f \u0634\u062f ('+nums+' \u0648\u0631\u0642).');
+  return out;
+}
+var _o_impParseMatrix21=impParseMatrix;
+impParseMatrix=function(rows,color){
+  var used=rows,shifted=null;
+  try{shifted=imp21Shift(rows)}catch(e){shifted=null}
+  if(shifted)used=shifted;
+  var res=_o_impParseMatrix21(used,color)||{items:[],errors:[]};
+  /* هر شیت فقط یک بار شمرده شود (پارسر ممکن است چندبار صدا زده شود) */
+  try{
+    if(!IMP21.seen)IMP21.seen={};
+    var sig=String(color)+'#'+rows.length+'#'+(rows[0]||[]).join(',')+'#'+((rows[rows.length-1]||[]).join(','));
+    if(IMP21.seen[sig]){try{if(typeof _impDiag!=='undefined'&&_impDiag&&_impDiag.length)_impDiag.pop()}catch(e){}return res;}
+    IMP21.seen[sig]=1;
+  }catch(e){}
+  /* شمارش کنترلی: هر سلول طولٔ معتبر = یک ورق */
+  try{
+    var hi=imp21HeaderRow(rows),cells=0;
+    if(hi>=0){
+      for(var ri=hi+1;ri<rows.length;ri++){
+        var rr=rows[ri];if(!rr)continue;
+        var f=imp21Cell(rr,0);
+        if(/\u0633\u0627\u0646\u062a\u06cc|\u0645\u062a\u0631|\u062c\u0645\u0639/.test(f))continue;
+        var lab=0;
+        for(var c2=1;c2<rr.length;c2++){var v2=imp21Cell(rr,c2);if(v2&&isNaN(imp21Num(v2)))lab++}
+        if(lab>=2)continue;
+        for(var c=0;c<rr.length;c++){
+          if(c===0&&!shifted)continue;
+          if(imp21IsLen(imp21Cell(rr,c)))cells++;
+        }
+      }
+    }
+    var got=0;(res.items||[]).forEach(function(it){got+=Number(it.sq)||0});
+    IMP21.cells+=cells;IMP21.read+=got;
+    if(cells>got)IMP21.warn.push('\u062f\u0631 \u0634\u06cc\u062a \u00ab'+color+'\u00bb '+(cells-got)+' \u0633\u0644\u0648\u0644 \u062e\u0648\u0627\u0646\u062f\u0647 \u0646\u0634\u062f.');
+  }catch(e){}
+  return res;
+};
+var _o_impRead21=impRead;
+impRead=function(inp){IMP21={warn:[],read:0,cells:0,addedCols:[],seen:{}};return _o_impRead21(inp)};
+/* گزارش کنترل در پیش‌نمایش ورود */
+if(typeof impRender==='function'){
+  var _o_impRender21=impRender;
+  impRender=function(){
+    var r=_o_impRender21.apply(this,arguments);
+    try{
+      var body=document.querySelector('#imp-body');
+      if(body&&(IMP21.cells||IMP21.addedCols.length)){
+        var old=document.getElementById('imp21-note');if(old)old.remove();
+        var lines=[];
+        lines.push('\u062f\u0631 \u0641\u0627\u06cc\u0644 '+faNum(IMP21.cells)+' \u0648\u0631\u0642 \u0634\u0645\u0631\u062f\u0647 \u0634\u062f \u0648 '+faNum(IMP21.read)+' \u0648\u0631\u0642 \u062e\u0648\u0627\u0646\u062f\u0647 \u0634\u062f.');
+        IMP21.addedCols.forEach(function(a){
+          lines.push('\u0633\u062a\u0648\u0646 \u0627\u0648\u0644 \u0628\u0647\u200c\u0639\u0646\u0648\u0627\u0646 \u0628\u0631\u0646\u062f \u00ab'+esc(a.brand)+'\u00bb \u0628\u0627 '+faNum(a.cells)+' \u0648\u0631\u0642 \u0634\u0646\u0627\u0633\u0627\u06cc\u06cc \u0634\u062f.');
+        });
+        IMP21.warn.forEach(function(w){lines.push(esc(w))});
+        var cls=(IMP21.cells>IMP21.read||IMP21.warn.length)?'notice red':'notice';
+        var d=document.createElement('div');
+        d.id='imp21-note';d.className=cls;d.style.margin='8px 0';
+        d.innerHTML=lines.join('<br>');
+        body.insertBefore(d,body.firstChild);
+      }
+    }catch(e){}
+    return r;
+  };
+}
+
+
+/* ================= ROUND 18: پرداخت و حسابداری مشتری ================= */
+(function(){
+
+function payDigits(s){return String(s==null?'':s).replace(/\D/g,'')}
+function payNowTime(){var d=new Date();return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')}
+window.payTimeMask=function(el){var v=latinDigits(String(el.value)).replace(/[^0-9]/g,'').slice(0,4);el.value=v.length>2?v.slice(0,2)+':'+v.slice(2):v};
+window.payBalText=function(x){x=Math.round(Number(x)||0);return x>0?fmt(x)+' بدهکار':x<0?fmt(-x)+' بستانکار':'تسویه'};
+window.payBalClass=function(x){return x>0?'red':x<0?'green':'gray'};
+window.payOpening=function(cid){var c=(DB.customers||[]).find(function(x){return x.id===cid});return Math.round(Number(c&&(c.openingBalance!=null?c.openingBalance:c.balance))||0)};
+window.payOf=function(id){return (DB.payments||[]).find(function(p){return p.id===id})};
+window.payCustPays=function(cid){return (DB.payments||[]).filter(function(p){return p.customerId===cid})};
+window.payInvRemain=function(v){
+  var paid=(DB.payments||[]).filter(function(p){return p.invoiceId===v.id||(p.invoiceNumber&&String(p.invoiceNumber)===String(v.number)&&p.customerId===v.customerId)})
+    .reduce(function(s,p){return s+(Number(p.amount)||0)},0);
+  return Math.round(invTotal(v)-paid);
+};
+
+/* ---- ماندهٔ اولیه در ماندهٔ حساب لحاظ شود ---- */
+var _o_custBalance18=custBalance;
+custBalance=function(cid){return Math.round(_o_custBalance18(cid)+payOpening(cid))};
+
+var _o_custEvents18=custEvents;
+custEvents=function(cid){
+  var ev=_o_custEvents18(cid)||[];
+  ev=ev.map(function(e){
+    if(e.credit>0&&!e._pay){
+      var p=(DB.payments||[]).find(function(x){return x.customerId===cid&&Number(x.amount)===Number(e.credit)&&String(e.label||'').indexOf(x.number)>=0});
+      if(p){e=Object.assign({},e,{_pay:p.id,label:payLabel(p)})}
+    }
+    return e;
+  });
+  var op=payOpening(cid);
+  if(op){
+    var c=(DB.customers||[]).find(function(x){return x.id===cid});
+    ev.unshift({date:(c&&c.createdAt)||'1300-01-01',label:'ماندهٔ اولیهٔ حساب',debit:op>0?op:0,credit:op<0?-op:0,_opening:true});
+  }
+  return ev;
+};
+function payLabel(p){
+  return 'دریافت '+(p.number||'')+' ('+(p.method||'نقدی')+')'+
+    (p.time?' ساعت '+faNum(p.time):'')+
+    (p.ref4?' — فیش ••••'+faNum(p.ref4):'')+
+    (p.invoiceNumber?' — بابت فاکتور '+faNum(p.invoiceNumber):'')+
+    (p.note?' — '+p.note:'')+
+    (p.settled?' 🗂':'');
+}
+window.payLabel=payLabel;
+
+/* ---- ماندهٔ اولیه ---- */
+window.openPayOpening=function(cid){
+  var c=(DB.customers||[]).find(function(x){return x.id===cid});if(!c)return;
+  var cur=payOpening(cid);
+  openModal('<h3>ماندهٔ اولیهٔ حساب — '+esc(c.name)+'</h3>'+
+  '<div class="sub">بدهی یا اعتبار مشتری پیش از شروع کار با این برنامه.</div>'+
+  '<div class="grid2" style="margin-top:10px">'+
+  '<div class="field"><label>مبلغ (تومان)</label><input id="po-amt" inputmode="numeric" oninput="fmtPriceInput(this)" value="'+(cur?fmt(Math.abs(cur)):'')+'"></div>'+
+  '<div class="field"><label>نوع</label><select id="po-kind"><option value="debit"'+(cur>=0?' selected':'')+'>بدهکار (به ما بدهکار است)</option><option value="credit"'+(cur<0?' selected':'')+'>بستانکار (از ما طلب دارد)</option></select></div></div>'+
+  '<div class="actions"><button class="btn primary" onclick="savePayOpening(\''+cid+'\')">ذخیره</button><button class="btn" onclick="openCustAccount(\''+cid+'\')">انصراف</button></div>');
+};
+window.savePayOpening=function(cid){
+  var c=(DB.customers||[]).find(function(x){return x.id===cid});if(!c)return;
+  var a=deNum(document.querySelector('#po-amt').value)||0;
+  var kind=document.querySelector('#po-kind').value;
+  c.openingBalance=kind==='credit'?-Math.abs(a):Math.abs(a);
+  if(c.balance!=null)delete c.balance;
+  logAct('payment','تعیین ماندهٔ اولیهٔ حساب «'+c.name+'»: '+fmt(c.openingBalance));
+  save();openCustAccount(cid);
+};
+
+/* ---- فرم دریافت وجه ---- */
+function payInvOptions(cid,sel){
+  var list=(DB.invoices||[]).filter(function(v){return v.customerId===cid&&v.type==='invoice'&&v.status!=='باطل‌شده'})
+    .sort(function(a,b){return String(b.date).localeCompare(String(a.date))});
+  var o='<option value="">— بدون اتصال (حساب کلی مشتری) —</option>';
+  list.forEach(function(v){
+    var rem=payInvRemain(v);
+    o+='<option value="'+esc(v.id)+'"'+(sel===v.id?' selected':'')+'>فاکتور '+faNum(v.number)+' — '+faDate(v.date)+' — '+(rem>0?'مانده '+fmt(rem):'تسویه')+'</option>';
+  });
+  return o;
+}
+window.payFormHTML=function(cid,sel,p){
+  p=p||{};
+  var b=custBalance(cid);
+  return '<div class="field"><label>مشتری</label><select id="pm-cust" onchange="payCustChanged()">'+
+    (DB.customers||[]).filter(function(c){return !c._deleted}).map(function(c){return '<option value="'+esc(c.id)+'"'+(cid===c.id?' selected':'')+'>'+esc(c.name)+'</option>'}).join('')+'</select></div>'+
+  '<div class="notice blue" id="pm-bal">ماندهٔ فعلی: <b>'+payBalText(b)+'</b></div>'+
+  '<div class="grid2">'+
+    '<div class="field"><label>مبلغ (تومان) *</label><input id="pm-amount" inputmode="numeric" oninput="fmtPriceInput(this);payPreview()" value="'+(p.amount?fmt(p.amount):'')+'"></div>'+
+    '<div class="field"><label>روش</label><select id="pm-method">'+['نقدی','کارت','واریز بانکی','چک','سایر'].map(function(m){return '<option'+(p.method===m?' selected':'')+'>'+m+'</option>'}).join('')+'</select></div>'+
+  '</div>'+
+  '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:-6px 0 10px">'+
+    '<button class="btn sm" onclick="payFill(\'all\')">کل مانده</button>'+
+    '<button class="btn sm" onclick="payFill(\'inv\')">ماندهٔ فاکتور انتخابی</button>'+
+    '<button class="btn sm" onclick="payFill(\'half\')">نیمی از مانده</button>'+
+  '</div>'+
+  '<div class="grid2">'+
+    '<div class="field"><label>تاریخ</label><input id="pm-date" inputmode="numeric" value="'+esc(p._jdate||todayJ())+'" oninput="jdInput(this)"></div>'+
+    '<div class="field"><label>ساعت</label><input id="pm-time" inputmode="numeric" maxlength="5" placeholder="۱۴:۳۰" value="'+esc(p.time||payNowTime())+'" oninput="payTimeMask(this)"></div>'+
+  '</div>'+
+  '<div class="grid2">'+
+    '<div class="field"><label>۴ رقم آخر فیش/کارت (اختیاری)</label><input id="pm-ref4" inputmode="numeric" maxlength="4" value="'+esc(p.ref4||'')+'" oninput="this.value=latinDigits(this.value).replace(/\\D/g,\'\').slice(0,4)"></div>'+
+    '<div class="field"><label>بابت فاکتور</label><select id="pm-inv" onchange="payPreview()">'+payInvOptions(cid,sel)+'</select></div>'+
+  '</div>'+
+  '<div class="field"><label>توضیح (اختیاری)</label><input id="pm-note" value="'+esc(p.note||'')+'"></div>'+
+  '<div class="notice" id="pm-preview"></div>';
+};
+window.payCustChanged=function(){
+  var cid=document.querySelector('#pm-cust').value;
+  var sel=document.querySelector('#pm-inv');
+  if(sel)sel.innerHTML=payInvOptions(cid,'');
+  var bx=document.querySelector('#pm-bal');
+  if(bx)bx.innerHTML='ماندهٔ فعلی: <b>'+payBalText(custBalance(cid))+'</b>';
+  payPreview();
+};
+window.payFill=function(mode){
+  var cid=document.querySelector('#pm-cust').value;
+  var amt=0;
+  if(mode==='all')amt=Math.max(0,custBalance(cid));
+  else if(mode==='half')amt=Math.max(0,Math.round(custBalance(cid)/2));
+  else{
+    var id=document.querySelector('#pm-inv').value;
+    var v=(DB.invoices||[]).find(function(x){return x.id===id});
+    amt=v?Math.max(0,payInvRemain(v)):0;
+  }
+  var el=document.querySelector('#pm-amount');
+  el.value=amt?fmt(amt):'';payPreview();
+};
+window.payPreview=function(){
+  var box=document.querySelector('#pm-preview');if(!box)return;
+  var cid=document.querySelector('#pm-cust').value;
+  var a=deNum(document.querySelector('#pm-amount').value)||0;
+  var edit=window._payEdit&&window._payEdit.id?payOf(window._payEdit.id):null;
+  var b=custBalance(cid)+(edit&&edit.customerId===cid?Number(edit.amount)||0:0);
+  var after=b-a;
+  var id=document.querySelector('#pm-inv').value;
+  var v=(DB.invoices||[]).find(function(x){return x.id===id});
+  var extra='';
+  if(v){
+    var rem=payInvRemain(v)+(edit&&edit.invoiceId===v.id?Number(edit.amount)||0:0)-a;
+    extra='<br>ماندهٔ فاکتور '+faNum(v.number)+' پس از این دریافت: <b>'+(rem>0?fmt(rem):'تسویه ✔')+'</b>'+
+      (rem<0?'<br><b style="color:var(--red)">⚠ مبلغ از ماندهٔ فاکتور بیشتر است؛ مازاد به حساب کلی می‌رود.</b>':'');
+  }
+  box.innerHTML='ماندهٔ حساب پس از این دریافت: <b>'+payBalText(after)+'</b>'+extra;
+};
+
+var _o_openPayment18=window.openPayment;
+window.openPayment=function(custId,invNumber){
+  window._payEdit=null;
+  var cid=custId||((DB.customers||[])[0]||{}).id;
+  if(!cid){toast('ابتدا مشتری را ثبت کنید.');return}
+  var sel='';
+  if(invNumber){var v=(DB.invoices||[]).find(function(x){return x.customerId===cid&&String(x.number)===String(invNumber)});if(v)sel=v.id}
+  openModal('<h3>ثبت دریافت وجه</h3>'+payFormHTML(cid,sel,{})+
+    '<div class="actions"><button class="btn primary" onclick="savePayment()">ثبت دریافت</button><button class="btn" onclick="closeModal()">انصراف</button></div>');
+  payPreview();
+};
+
+window.savePayment=function(){
+  var cid=document.querySelector('#pm-cust').value;
+  var amount=deNum(document.querySelector('#pm-amount').value);
+  if(!cid||!(amount>0)){toast('مبلغ دریافتی را وارد کنید.');return}
+  var dateISO=jdToISO(document.querySelector('#pm-date').value)||todayISO();
+  var invId=document.querySelector('#pm-inv').value;
+  var v=(DB.invoices||[]).find(function(x){return x.id===invId});
+  DB.counters.receipt=(DB.counters.receipt||0)+1;
+  var rec={id:uid(),number:'R-'+DB.counters.receipt,customerId:cid,amount:amount,
+    method:document.querySelector('#pm-method').value,date:dateISO,
+    time:String(document.querySelector('#pm-time').value||'').trim(),
+    ref4:payDigits(document.querySelector('#pm-ref4').value).slice(-4),
+    invoiceId:v?v.id:'',invoiceNumber:v?String(v.number):'',
+    note:String(document.querySelector('#pm-note').value||'').trim(),
+    createdBy:(session&&session.name)||'',createdAt:new Date().toISOString()};
+  DB.payments.push(rec);
+  (DB.invoices||[]).filter(function(x){return x.customerId===cid&&x.type==='invoice'}).forEach(refreshInvStatus);
+  logAct('payment','ثبت دریافت وجه '+fmt(amount)+' تومان'+(rec.ref4?' (فیش '+rec.ref4+')':''));
+  save();closeModal();render();
+  var b=custBalance(cid);
+  toast('دریافت '+rec.number+' ثبت شد — مانده: '+payBalText(b));
+  if(b===0)setTimeout(function(){payAskArchive(cid)},400);
+};
+
+/* ---- ویرایش / حذف / انتقال دریافت ---- */
+window.openPayEdit=function(id){
+  var p=payOf(id);if(!p){toast('این دریافت پیدا نشد.');return}
+  if(typeof PermissionService!=='undefined'&&PermissionService.hasPermission&&!isManager()){
+    toast('ویرایش دریافت وجه فقط با دسترسی مدیر امکان‌پذیر است.');return;
+  }
+  window._payEdit={id:id};
+  var jd='';try{jd=faNum(jFromISO?jFromISO(p.date):'')}catch(e){jd=''}
+  openModal('<h3>ویرایش دریافت '+faNum(p.number||'')+'</h3>'+
+    payFormHTML(p.customerId,p.invoiceId||'',{amount:p.amount,method:p.method,time:p.time,ref4:p.ref4,note:p.note,_jdate:(typeof isoToJd==='function'?isoToJd(p.date):'')})+
+    '<div class="actions"><button class="btn primary" onclick="savePayEdit()">ذخیره تغییرات</button>'+
+    '<button class="btn danger" onclick="payDelete(\''+id+'\')">حذف دریافت</button>'+
+    '<button class="btn" onclick="openCustAccount(\''+p.customerId+'\')">بازگشت</button></div>');
+  var d=document.querySelector('#pm-date');
+  if(d&&!d.value)d.value=todayJ();
+  payPreview();
+};
+window.savePayEdit=function(){
+  var e=window._payEdit||{};var p=payOf(e.id);if(!p)return;
+  var amount=deNum(document.querySelector('#pm-amount').value);
+  if(!(amount>0)){toast('مبلغ را وارد کنید.');return}
+  var before=p.amount;
+  var cid=document.querySelector('#pm-cust').value;
+  var invId=document.querySelector('#pm-inv').value;
+  var v=(DB.invoices||[]).find(function(x){return x.id===invId});
+  p.customerId=cid;p.amount=amount;
+  p.method=document.querySelector('#pm-method').value;
+  p.date=jdToISO(document.querySelector('#pm-date').value)||p.date;
+  p.time=String(document.querySelector('#pm-time').value||'').trim();
+  p.ref4=payDigits(document.querySelector('#pm-ref4').value).slice(-4);
+  p.invoiceId=v?v.id:'';p.invoiceNumber=v?String(v.number):'';
+  p.note=String(document.querySelector('#pm-note').value||'').trim();
+  p.editedBy=(session&&session.name)||'';p.editedAt=new Date().toISOString();
+  (DB.invoices||[]).filter(function(x){return x.type==='invoice'}).forEach(refreshInvStatus);
+  logAct('payment','ویرایش دریافت '+(p.number||'')+': '+fmt(before)+' ← '+fmt(amount));
+  if(typeof auditLog==='function')auditLog('payment_edit',{id:p.id,before:before,after:amount});
+  save();window._payEdit=null;openCustAccount(p.customerId);render();
+  toast('دریافت ویرایش شد — مانده: '+payBalText(custBalance(p.customerId)));
+};
+window.payDelete=async function(id){
+  var p=payOf(id);if(!p)return;
+  if(!isManager()){toast('حذف دریافت وجه فقط با دسترسی مدیر امکان‌پذیر است.');return}
+  var ok=await uiConfirm('دریافت '+faNum(p.number||'')+' به مبلغ '+fmt(p.amount)+' تومان حذف شود؟ ماندهٔ مشتری همین مقدار بیشتر می‌شود.');
+  if(!ok)return;
+  var cid=p.customerId;
+  DB.payments=(DB.payments||[]).filter(function(x){return x.id!==id});
+  (DB.invoices||[]).filter(function(x){return x.type==='invoice'}).forEach(refreshInvStatus);
+  logAct('payment','حذف دریافت '+(p.number||'')+' به مبلغ '+fmt(p.amount));
+  if(typeof auditLog==='function')auditLog('payment_delete',{id:id,amount:p.amount});
+  save();openCustAccount(cid);render();
+  toast('دریافت حذف شد — مانده: '+payBalText(custBalance(cid)));
+};
+
+/* ---- بایگانی صورتحساب ---- */
+window.payAskArchive=async function(cid){
+  var open=payCustPays(cid).filter(function(p){return !p.settled});
+  if(!open.length)return;
+  if(await uiConfirm('حساب تسویه شد ✔ صورتحساب این دوره بایگانی شود؟'))payArchive(cid);
+};
+window.payArchive=async function(cid){
+  var c=(DB.customers||[]).find(function(x){return x.id===cid});if(!c)return;
+  var open=payCustPays(cid).filter(function(p){return !p.settled});
+  if(!open.length){toast('دریافت بایگانی‌نشده‌ای وجود ندارد.');return}
+  var sum=open.reduce(function(s,p){return s+(Number(p.amount)||0)},0);
+  if(!await uiConfirm(faNum(open.length)+' دریافت به جمع '+fmt(sum)+' تومان بایگانی شود؟ در صورتحساب جدید نمی‌آید ولی در تاریخچه محفوظ است.'))return;
+  DB.statements=DB.statements||[];
+  DB.statements.push({id:uid(),customerId:cid,date:todayISO(),count:open.length,sum:sum,
+    balanceAfter:custBalance(cid),by:(session&&session.name)||'',
+    items:open.map(function(p){return {number:p.number,date:p.date,time:p.time,amount:p.amount,ref4:p.ref4,method:p.method,note:p.note}})});
+  open.forEach(function(p){p.settled=true});
+  logAct('payment','بایگانی صورتحساب «'+c.name+'» — '+faNum(open.length)+' دریافت');
+  save();openCustAccount(cid);
+  toast('صورتحساب بایگانی شد.');
+};
+
+/* ---- پیام مانده به مشتری ---- */
+window.payShareBalance=function(cid){
+  var c=(DB.customers||[]).find(function(x){return x.id===cid});if(!c)return;
+  var b=custBalance(cid);
+  var last=payCustPays(cid).slice(-3).reverse();
+  var txt=(typeof COMPANY!=='undefined'&&COMPANY&&COMPANY.name?COMPANY.name+'\n':'')+
+    'جناب '+c.name+'، وضعیت حساب شما:\n'+
+    'مانده: '+payBalText(b)+' تومان\n'+
+    (last.length?'\nآخرین دریافت‌ها:\n'+last.map(function(p){return '• '+faDate(p.date)+(p.time?' ساعت '+p.time:'')+' — '+fmt(p.amount)+' تومان'+(p.ref4?' (فیش '+p.ref4+')':'')}).join('\n')+'\n':'')+
+    '\nتاریخ گزارش: '+faDate(todayISO());
+  openModal('<h3>پیام ماندهٔ حساب</h3>'+
+    '<textarea id="pay-share" rows="9" style="width:100%;direction:rtl">'+esc(txt)+'</textarea>'+
+    '<div class="actions">'+
+    '<button class="btn primary" onclick="payCopyShare()">کپی متن</button>'+
+    (c.phone?'<a class="btn" target="_blank" href="https://wa.me/'+String(c.phone).replace(/\D/g,'').replace(/^0/,'98')+'?text='+encodeURIComponent(txt)+'">ارسال در واتساپ</a>':'')+
+    '<button class="btn" onclick="openCustAccount(\''+cid+'\')">بازگشت</button></div>');
+};
+window.payCopyShare=function(){
+  var t=document.querySelector('#pay-share');if(!t)return;
+  t.select();try{document.execCommand('copy')}catch(e){}
+  if(navigator.clipboard)navigator.clipboard.writeText(t.value).catch(function(){});
+  toast('متن کپی شد.');
+};
+
+/* ---- پنل حساب مشتری ---- */
+window.openCustAccount=function(cid){
+  var c=(DB.customers||[]).find(function(x){return x.id===cid});if(!c){toast('مشتری پیدا نشد.');return}
+  var b=custBalance(cid),op=payOpening(cid);
+  var pays=payCustPays(cid);
+  var paid=pays.reduce(function(s,p){return s+(Number(p.amount)||0)},0);
+  var buy=custTotalBuy(cid);
+  var ev=custEvents(cid),run=0;
+  var rows=ev.map(function(e){
+    run+=(e.debit||0)-(e.credit||0);
+    var btns='';
+    if(e._pay)btns='<button class="btn sm" onclick="openPayEdit(\''+e._pay+'\')">ویرایش</button>';
+    else if(e._opening)btns='<button class="btn sm" onclick="openPayOpening(\''+cid+'\')">ویرایش</button>';
+    return '<tr><td>'+faDate(e.date)+'</td><td>'+esc(e.label||'')+'</td>'+
+      '<td class="num">'+(e.debit?fmt(e.debit):'—')+'</td>'+
+      '<td class="num">'+(e.credit?fmt(e.credit):'—')+'</td>'+
+      '<td class="num">'+payBalText(run)+'</td><td>'+btns+'</td></tr>';
+  }).join('');
+  var arch=(DB.statements||[]).filter(function(s){return s.customerId===cid});
+  openModal('<h3>حساب '+esc(c.name)+'</h3>'+
+  '<div class="pc-stocks" style="margin:10px 0">'+
+    '<div><span>جمع خرید</span><b class="num">'+fmt(buy)+'</b></div>'+
+    '<div><span>جمع دریافت</span><b class="num">'+fmt(paid)+'</b></div>'+
+    '<div><span>ماندهٔ اولیه</span><b class="num">'+(op?fmt(op):'۰')+'</b></div>'+
+    '<div class="tot"><span>ماندهٔ حساب</span><b class="num"><span class="badge '+payBalClass(b)+'">'+payBalText(b)+'</span></b></div>'+
+  '</div>'+
+  '<div class="actions" style="margin-bottom:8px">'+
+    '<button class="btn primary" onclick="openPayment(\''+cid+'\')">＋ ثبت دریافت وجه</button>'+
+    '<button class="btn" onclick="payShareBalance(\''+cid+'\')">📩 پیام مانده</button>'+
+    '<button class="btn" onclick="openPayOpening(\''+cid+'\')">ماندهٔ اولیه</button>'+
+  '</div>'+
+  '<div class="tblwrap" style="max-height:320px;overflow:auto"><table class="tbl"><thead><tr><th>تاریخ</th><th>شرح</th><th>بدهکار</th><th>بستانکار</th><th>مانده</th><th></th></tr></thead><tbody>'+
+  (rows||'<tr><td colspan="6" class="sub">گردشی برای این مشتری ثبت نشده.</td></tr>')+
+  '</tbody></table></div>'+
+  (arch.length?'<div class="notice" style="margin-top:8px">🗂 صورتحساب‌های بایگانی‌شده:'+arch.map(function(s){return '<br>• '+faDate(s.date)+' — '+faNum(s.count)+' فقره — جمع '+fmt(s.sum)+' تومان'}).join('')+'</div>':'')+
+  '<div class="actions" style="margin-top:10px">'+
+    '<button class="btn" onclick="payArchive(\''+cid+'\')">🗂 تسویه و بایگانی صورتحساب</button>'+
+    (typeof exportCustomerExcel==='function'?'<button class="btn" onclick="exportCustomerExcel(\''+cid+'\')">📊 اکسل صورتحساب</button>':'')+
+    (typeof printStatement==='function'?'<button class="btn" onclick="printStatement(\''+cid+'\')">🖨 چاپ / PDF</button>':'')+
+    '<button class="btn" onclick="closeModal()">بستن</button>'+
+  '</div>',true);
+};
+
+/* ---- کنترل پرداخت‌ها: جمع، ویرایش و حذف ---- */
+var _o_pagePaymentControl18=window.pagePaymentControl;
+window.pagePaymentControl=function(){
+  if(!isManager())return '<div class="empty">فقط مدیر به این بخش دسترسی دارد.</div>';
+  var pays=(DB.payments||[]).slice().sort(function(a,b){return String(b.date).localeCompare(String(a.date))});
+  var total=pays.reduce(function(s,p){return s+(Number(p.amount)||0)},0);
+  var today=todayISO().slice(0,10);
+  var todaySum=pays.filter(function(p){return String(p.date||'').slice(0,10)===today}).reduce(function(s,p){return s+(Number(p.amount)||0)},0);
+  var byMethod={};pays.forEach(function(p){var m=p.method||'نقدی';byMethod[m]=(byMethod[m]||0)+(Number(p.amount)||0)});
+  var debt=(DB.customers||[]).filter(function(c){return !c._deleted}).reduce(function(s,c){var b=custBalance(c.id);return s+(b>0?b:0)},0);
+  return '<div class="pagehead"><div><div class="h1">'+ic('credit-card',22)+' کنترل پرداخت‌ها</div><div class="sub">'+faNum(pays.length)+' دریافت</div></div>'+
+    '<button class="btn primary" onclick="openPayment()">＋ ثبت دریافت وجه</button></div>'+
+    '<div class="pc-stocks" style="margin:10px 0">'+
+      '<div><span>کل وصولی</span><b class="num">'+fmt(total)+'</b></div>'+
+      '<div><span>وصولی امروز</span><b class="num">'+fmt(todaySum)+'</b></div>'+
+      '<div class="tot"><span>ماندهٔ طلب از مشتریان</span><b class="num">'+fmt(debt)+'</b></div>'+
+    '</div>'+
+    '<div class="card"><h3>تفکیک روش پرداخت</h3>'+
+      (Object.keys(byMethod).length?Object.keys(byMethod).map(function(m){return '<div class="sumline"><span>'+esc(m)+'</span><b class="num">'+fmt(byMethod[m])+'</b></div>'}).join(''):'<div class="sub">موردی نیست.</div>')+
+    '</div>'+
+    '<div class="card">'+(pays.length?'<div class="tblwrap"><table class="tbl"><thead><tr><th>تاریخ</th><th>شماره</th><th>مشتری</th><th>مبلغ</th><th>روش</th><th>فیش</th><th>بابت فاکتور</th><th>ثبت‌کننده</th><th></th></tr></thead><tbody>'+
+      pays.map(function(p){
+        var c=(DB.customers||[]).find(function(x){return x.id===p.customerId});
+        return '<tr><td>'+faDate(p.date||p.createdAt)+(p.time?' <span class="sub">'+faNum(p.time)+'</span>':'')+'</td>'+
+          '<td>'+faNum(p.number||'—')+'</td>'+
+          '<td>'+(c?'<a href="javascript:void(0)" onclick="openCustAccount(\''+p.customerId+'\')">'+esc(c.name)+'</a>':'—')+'</td>'+
+          '<td class="num">'+fmt(p.amount)+'</td><td>'+esc(p.method||'—')+'</td>'+
+          '<td class="sub">'+(p.ref4?'••••'+faNum(p.ref4):'—')+'</td>'+
+          '<td class="sub">'+(p.invoiceNumber?faNum(p.invoiceNumber):'حساب کلی')+'</td>'+
+          '<td class="sub">'+esc(p.createdBy||'—')+(p.settled?' 🗂':'')+'</td>'+
+          '<td><button class="btn sm" onclick="openPayEdit(\''+p.id+'\')">ویرایش</button></td></tr>';
+      }).join('')+'</tbody></table></div>':'<div class="empty">دریافتی ثبت نشده.</div>')+'</div>';
+};
+
+/* ---- دکمهٔ حساب در صفحهٔ مشتری ---- */
+var _o_pageCustomerDetail18=window.pageCustomerDetail;
+if(typeof _o_pageCustomerDetail18==='function'){
+  window.pageCustomerDetail=function(){
+    var html=_o_pageCustomerDetail18.apply(this,arguments);
+    try{
+      var c=(typeof route!=='undefined')&&route.param;
+      if(c&&String(html).indexOf('openPayment(')>=0){
+        html=String(html).replace("<button class=\"btn primary\" onclick=\"openPayment('"+c+"')\">\u062b\u0628\u062a \u062f\u0631\u06cc\u0627\u0641\u062a \u0648\u062c\u0647</button>",
+          "<button class=\"btn primary\" onclick=\"openPayment('"+c+"')\">\u062b\u0628\u062a \u062f\u0631\u06cc\u0627\u0641\u062a \u0648\u062c\u0647</button><button class=\"btn\" onclick=\"openCustAccount('"+c+"')\">\u062d\u0633\u0627\u0628 \u0648 \u062f\u0631\u06cc\u0627\u0641\u062a\u200c\u0647\u0627</button>");
+      }
+    }catch(e){}
+    return html;
+  };
+}
+
+})();
+
+
+/* ================= ROUND 19: پیش‌پرداخت / اعتبار مشتری ================= */
+(function(){
+
+/* اعتبار (پیش‌پرداخت) مشتری = ماندهٔ بستانکار */
+/* پیش‌پرداخت قابل تخصیص = دریافت‌هایی که به فاکتوری متصل نیستند */
+window.preCredit=function(cid){return (DB.payments||[]).reduce(function(s,p){return s+((p.customerId===cid&&!p.invoiceId&&!String(p.invoiceNumber||'').trim())?(Number(p.amount)||0):0)},0)};
+/* اعتبار خالص (ماندهٔ بستانکار) */
+window.preNetCredit=function(cid){var b=custBalance(cid);return b<0?-b:0};
+/* دریافت‌هایی که به فاکتوری متصل نیستند */
+window.preUnlinked=function(cid){
+  return (DB.payments||[]).filter(function(p){return p.customerId===cid&&!p.invoiceId&&!String(p.invoiceNumber||'').trim()})
+    .sort(function(a,b){return String(a.date).localeCompare(String(b.date))});
+};
+window.preCreditText=function(cid){var c=preCredit(cid);return c>0?fmt(c)+' تومان پیش‌پرداخت/اعتبار':''};
+
+/* تخصیص پیش‌پرداخت به یک فاکتور (بدون ثبت پول جدید) */
+window.preAllocate=function(invId,limit){
+  var v=(DB.invoices||[]).find(function(x){return x.id===invId});
+  if(!v||v.type!=='invoice'||v.status==='باطل‌شده')return {applied:0,used:[]};
+  var remain=Math.max(0,invTotal(v)-invPaid(v));
+  var credit=preCredit(v.customerId);
+  var room=Math.min(remain,credit,(limit==null?Infinity:Math.max(0,limit)));
+  if(!(room>0))return {applied:0,used:[]};
+  var applied=0,used=[];
+  var list=preUnlinked(v.customerId);
+  for(var i=0;i<list.length&&applied<room;i++){
+    var p=list[i];var amt=Number(p.amount)||0;if(amt<=0)continue;
+    var take=Math.min(amt,room-applied);
+    if(take>=amt){
+      p.invoiceId=v.id;p.invoiceNumber=String(v.number);
+      p.note=(p.note?p.note+' — ':'')+'تخصیص پیش‌پرداخت';
+    }else{
+      /* تقسیم دریافت: بخشی به فاکتور، باقی در حساب کلی */
+      p.amount=amt-take;
+      DB.counters.receipt=(DB.counters.receipt||0)+1;
+      DB.payments.push({id:uid(),number:'R-'+DB.counters.receipt,customerId:p.customerId,
+        amount:take,method:p.method||'پیش‌پرداخت',date:p.date,time:p.time||'',ref4:p.ref4||'',
+        invoiceId:v.id,invoiceNumber:String(v.number),
+        note:'تخصیص بخشی از پیش‌پرداخت '+(p.number||''),
+        fromPrepay:p.id,createdBy:(session&&session.name)||'',createdAt:new Date().toISOString()});
+    }
+    applied+=take;used.push({number:p.number,amount:take});
+  }
+  if(applied>0){
+    refreshInvStatus(v);
+    logAct('payment','تخصیص '+fmt(applied)+' تومان پیش‌پرداخت به فاکتور '+v.number);
+    save();
+  }
+  return {applied:applied,used:used,remain:Math.max(0,invTotal(v)-invPaid(v))};
+};
+
+/* تخصیص خودکار پس از صدور فاکتور */
+if(typeof SalesCart!=='undefined'&&SalesCart&&typeof SalesCart.createInvoice==='function'){
+  var _o_createInvoice19=SalesCart.createInvoice.bind(SalesCart);
+  SalesCart.createInvoice=async function(type){
+    var cid=(SalesCart.getCart&&SalesCart.getCart()||{}).customerId;
+    var before=cid?preCredit(cid):0;
+    var res=await _o_createInvoice19(type);
+    try{
+      if(res&&res.success&&res.invoice&&res.invoice.type==='invoice'&&before>0&&window.prePayAuto!==false){
+        var r=preAllocate(res.invoice.id);
+        if(r.applied>0){
+          setTimeout(function(){
+            toast('پیش‌پرداخت مشتری به مبلغ '+fmt(r.applied)+' تومان به این فاکتور منظور شد'+(r.remain>0?' — مانده: '+fmt(r.remain):' — فاکتور تسویه شد ✔'));
+            render();
+          },700);
+        }
+      }
+    }catch(e){}
+    return res;
+  };
+}
+
+/* اعلان پیش‌پرداخت در صفحهٔ فاکتورزنی */
+var _o_pageNewInvoice19=window.pageNewInvoice;
+if(typeof _o_pageNewInvoice19==='function'){
+  window.pageNewInvoice=function(){
+    var html=_o_pageNewInvoice19.apply(this,arguments);
+    try{
+      var cid=(typeof draft!=='undefined'&&draft)?draft.customerId:null;
+      var credit=cid?preCredit(cid):0;
+      var marker='<h3>\u06f4. \u067e\u0631\u062f\u0627\u062e\u062a</h3>';
+      if(credit>0&&String(html).indexOf(marker)>=0){
+        var total=0;try{total=invTotal({items:draft.items||[]})-(draft.discount||0)+(draft.shipping||0)}catch(e){}
+        var willUse=Math.min(credit,Math.max(0,total));
+        var note='<div class="notice green" style="margin:8px 0">💰 این مشتری <b>'+fmt(credit)+' تومان</b> پیش‌پرداخت (اعتبار) دارد.'+
+          (willUse>0?'<br>هنگام ثبت فاکتور، <b>'+fmt(willUse)+' تومان</b> از این اعتبار خودکار به همین فاکتور منظور می‌شود.':'')+
+          '<br><label style="display:inline-flex;gap:6px;align-items:center;margin-top:6px"><input type="checkbox" '+(window.prePayAuto===false?'':'checked')+' onchange="prePaySetAuto(this.checked)"> اعمال خودکار پیش‌پرداخت</label>'+
+          ' <span class="sub">(پیش‌پرداخت دوباره دریافت نمی‌شود؛ فقط به این فاکتور تخصیص می‌خورد.)</span></div>';
+        html=String(html).replace(marker,marker+note);
+      }
+    }catch(e){}
+    return html;
+  };
+}
+window.prePaySetAuto=function(on){window.prePayAuto=!!on;toast(on?'پیش‌پرداخت خودکار اعمال می‌شود.':'پیش‌پرداخت خودکار اعمال نمی‌شود.')};
+
+/* اعلان و دکمهٔ تخصیص در صفحهٔ فاکتور */
+var _o_pageInvoiceDetail19=window.pageInvoiceDetail;
+if(typeof _o_pageInvoiceDetail19==='function'){
+  window.pageInvoiceDetail=function(){
+    var html=_o_pageInvoiceDetail19.apply(this,arguments);
+    try{
+      var v=(DB.invoices||[]).find(function(x){return x.id===(typeof route!=='undefined'?route.param:null)});
+      if(v&&v.type==='invoice'&&v.status!=='باطل‌شده'){
+        var credit=preCredit(v.customerId);
+        var remain=Math.max(0,invTotal(v)-invPaid(v));
+        if(credit>0&&remain>0){
+          var use=Math.min(credit,remain);
+          var box='<div class="notice green" style="margin:8px 0">💰 مشتری <b>'+fmt(credit)+' تومان</b> پیش‌پرداخت دارد. '+
+            '<button class="btn sm" onclick="preApplyBtn(\''+v.id+'\')">تخصیص '+fmt(use)+' تومان به این فاکتور</button></div>';
+          var i=String(html).indexOf('</div>',String(html).indexOf('pagehead'));
+          html=i>0?String(html).slice(0,i+6)+box+String(html).slice(i+6):box+html;
+        }
+      }
+    }catch(e){}
+    return html;
+  };
+}
+window.preApplyBtn=async function(invId){
+  var v=(DB.invoices||[]).find(function(x){return x.id===invId});if(!v)return;
+  var use=Math.min(preCredit(v.customerId),Math.max(0,invTotal(v)-invPaid(v)));
+  if(!(use>0)){toast('پیش‌پرداختی برای تخصیص نیست.');return}
+  if(!await uiConfirm(fmt(use)+' تومان از پیش‌پرداخت مشتری به فاکتور '+faNum(v.number)+' منظور شود؟'))return;
+  var r=preAllocate(invId);
+  render();
+  toast(r.applied>0?fmt(r.applied)+' تومان پیش‌پرداخت منظور شد'+(r.remain>0?' — مانده: '+fmt(r.remain):' — تسویه شد ✔'):'تخصیصی انجام نشد.');
+};
+
+/* مدال تخصیص پیش‌پرداخت به فاکتورهای باز */
+window.openPreAlloc=function(cid){
+  var c=(DB.customers||[]).find(function(x){return x.id===cid});if(!c)return;
+  var credit=preCredit(cid);
+  var open=(DB.invoices||[]).filter(function(v){return v.customerId===cid&&v.type==='invoice'&&v.status!=='باطل‌شده'&&(invTotal(v)-invPaid(v))>0})
+    .sort(function(a,b){return String(a.date).localeCompare(String(b.date))});
+  openModal('<h3>تخصیص پیش‌پرداخت — '+esc(c.name)+'</h3>'+
+    '<div class="notice '+(credit>0?'green':'')+'">پیش‌پرداخت قابل تخصیص: <b>'+fmt(credit)+' تومان</b></div>'+
+    (open.length?'<div class="tblwrap" style="max-height:300px;overflow:auto"><table class="tbl"><thead><tr><th>فاکتور</th><th>تاریخ</th><th>مبلغ</th><th>مانده</th><th></th></tr></thead><tbody>'+
+      open.map(function(v){var rem=invTotal(v)-invPaid(v);return '<tr><td>'+faNum(v.number)+'</td><td>'+faDate(v.date)+'</td><td class="num">'+fmt(invTotal(v))+'</td><td class="num">'+fmt(rem)+'</td>'+
+        '<td>'+(credit>0?'<button class="btn sm" onclick="preApplyFromPanel(\''+v.id+'\',\''+cid+'\')">تخصیص '+fmt(Math.min(credit,rem))+'</button>':'—')+'</td></tr>'}).join('')+
+      '</tbody></table></div>':'<div class="empty">فاکتور تسویه‌نشده‌ای ندارد؛ پیش‌پرداخت به عنوان اعتبار باقی می‌ماند و روی فاکتور بعدی اعمال می‌شود.</div>')+
+    '<div class="actions"><button class="btn" onclick="openCustAccount(\''+cid+'\')">بازگشت به حساب</button><button class="btn" onclick="closeModal()">بستن</button></div>',true);
+};
+window.preApplyFromPanel=async function(invId,cid){
+  var r=preAllocate(invId);
+  render();
+  toast(r.applied>0?fmt(r.applied)+' تومان تخصیص یافت.':'تخصیصی انجام نشد.');
+  openPreAlloc(cid);
+};
+
+/* نمایش پیش‌پرداخت در فرم دریافت وجه */
+if(typeof window.payFormHTML==='function'){
+  var _o_payForm19=window.payFormHTML;
+  window.payFormHTML=function(cid,sel,p){
+    var html=_o_payForm19(cid,sel,p);
+    try{
+      var credit=preCredit(cid);
+      if(credit>0){
+        html=html.replace('<div class="grid2">','<div class="notice green">💰 این مشتری الان <b>'+fmt(credit)+' تومان</b> پیش‌پرداخت دارد؛ اگر فاکتوری را انتخاب نکنید، مبلغ جدید هم به اعتبار او اضافه می‌شود.</div><div class="grid2">');
+      }
+    }catch(e){}
+    return html;
+  };
+}
+
+/* پنل حساب مشتری: ردیف پیش‌پرداخت + دکمهٔ تخصیص */
+if(typeof window.openCustAccount==='function'){
+  var _o_openCustAccount19=window.openCustAccount;
+  window.openCustAccount=function(cid){
+    _o_openCustAccount19(cid);
+    try{
+      var credit=preCredit(cid);
+      var root=document.querySelector('#modal-root');if(!root)return;
+      var stats=root.querySelector('.pc-stocks');
+      if(stats){
+        var d=document.createElement('div');
+        d.innerHTML='<span>پیش‌پرداخت</span><b class="num">'+(credit?fmt(credit):'۰')+'</b>';
+        stats.insertBefore(d,stats.lastElementChild);
+      }
+      var acts=root.querySelector('.actions');
+      if(acts){
+        var b=document.createElement('button');
+        b.className='btn'+(credit>0?' primary':'');
+        b.textContent='💰 تخصیص پیش‌پرداخت';
+        b.onclick=function(){openPreAlloc(cid)};
+        acts.appendChild(b);
+      }
+    }catch(e){}
+  };
+}
+
+/* کنترل پرداخت‌ها: جمع پیش‌پرداخت مشتریان */
+if(typeof window.pagePaymentControl==='function'){
+  var _o_payCtrl19=window.pagePaymentControl;
+  window.pagePaymentControl=function(){
+    var html=_o_payCtrl19.apply(this,arguments);
+    try{
+      var pre=(DB.customers||[]).filter(function(c){return !c._deleted}).reduce(function(s,c){return s+preCredit(c.id)},0);
+      var marker='<div class="tot"><span>ماندهٔ طلب از مشتریان</span>';
+      if(String(html).indexOf(marker)>=0){
+        html=String(html).replace(marker,'<div><span>پیش‌پرداخت مشتریان</span><b class="num">'+fmt(pre)+'</b></div>'+marker);
+      }
+    }catch(e){}
+    return html;
+  };
+}
+
+/* کنترل مالی مشتریان: پیش‌پرداخت در خلاصه */
+if(typeof window.pageCustomerFinancial==='function'){
+  var _o_custFin19=window.pageCustomerFinancial;
+  window.pageCustomerFinancial=function(){
+    var html=_o_custFin19.apply(this,arguments);
+    try{
+      var list=(DB.customers||[]).filter(function(c){return !c._deleted&&preCredit(c.id)>0});
+      if(list.length&&String(html).indexOf('financial-summary')>=0){
+        var box='<div class="card"><h3>مشتریان با پیش‌پرداخت (اعتبار)</h3>'+
+          '<div class="tblwrap"><table class="tbl"><thead><tr><th>مشتری</th><th>اعتبار</th><th>فاکتور باز</th><th></th></tr></thead><tbody>'+
+          list.map(function(c){
+            var openN=(DB.invoices||[]).filter(function(v){return v.customerId===c.id&&v.type==='invoice'&&v.status!=='باطل‌شده'&&(invTotal(v)-invPaid(v))>0}).length;
+            return '<tr><td>'+esc(c.name)+'</td><td class="num">'+fmt(preCredit(c.id))+'</td><td>'+faNum(openN)+'</td>'+
+              '<td><button class="btn sm" onclick="openPreAlloc(\''+c.id+'\')">تخصیص</button></td></tr>';
+          }).join('')+'</tbody></table></div></div>';
+        html=String(html)+box;
+      }
+    }catch(e){}
+    return html;
+  };
+}
+
+/* لیست مشتریان: نشانهٔ اعتبار */
+if(typeof window.pageCustomers==='function'){
+  var _o_pageCustomers19=window.pageCustomers;
+  window.pageCustomers=function(){
+    var html=_o_pageCustomers19.apply(this,arguments);
+    try{
+      var pre=(DB.customers||[]).filter(function(c){return !c._deleted}).reduce(function(s,c){return s+preCredit(c.id)},0);
+      if(pre>0&&String(html).indexOf('pagehead')>=0){
+        var i=String(html).indexOf('</div>',String(html).indexOf('pagehead'));
+        var note='<div class="notice green" style="margin:8px 0">💰 جمع پیش‌پرداخت مشتریان: <b>'+fmt(pre)+' تومان</b> — این مبلغ هنگام صدور فاکتور خودکار اعمال می‌شود.</div>';
+        if(i>0)html=String(html).slice(0,i+6)+note+String(html).slice(i+6);
+      }
+    }catch(e){}
+    return html;
+  };
+}
+
+})();
+
+
+/* ================= ROUND 20: حسابداری خرید و کارخانه‌ها ================= */
+(function(){
+
+var TERMS=['\u0646\u0642\u062f\u06cc','\u0686\u06a9\u06cc','\u0627\u0645\u0627\u0646\u06cc','\u0645\u062f\u062a\u200c\u062f\u0627\u0631','\u0646\u0627\u0645\u0634\u062e\u0635'];
+window.SUP_TERMS=TERMS;
+
+/* --- راه‌اندازی ساختارها --- */
+window.supEnsure=function(){
+  if(!Array.isArray(DB.suppliers))DB.suppliers=[];
+  if(!Array.isArray(DB.purchases))DB.purchases=[];
+  if(!Array.isArray(DB.supplierPays))DB.supplierPays=[];
+  if(!DB.counters)DB.counters={};
+  if(!DB.counters.purchase)DB.counters.purchase=1000;
+  if(!DB.counters.spay)DB.counters.spay=1000;
+};
+window.supList=function(){supEnsure();return DB.suppliers.filter(function(s){return !s._deleted})
+  .sort(function(a,b){return String(a.name).localeCompare(String(b.name),'fa')})};
+window.supGet=function(id){supEnsure();return DB.suppliers.find(function(s){return s.id===id})||null};
+window.supName=function(id){var s=supGet(id);return s?s.name:'\u2014'};
+window.supByName=function(name,create){
+  supEnsure();
+  var n=String(name||'').trim();if(!n)return null;
+  var f=DB.suppliers.find(function(s){return String(s.name).trim()===n});
+  if(f||!create)return f||null;
+  var s={id:uid(),name:n,phone:'',note:'',defaultTerms:'\u0646\u0627\u0645\u0634\u062e\u0635',createdAt:new Date().toISOString()};
+  DB.suppliers.push(s);return s;
+};
+
+/* --- مبالغ --- */
+window.purAmount=function(p){return Math.max(0,Number(p&&p.amount)||0)};
+window.supPurchases=function(sid){supEnsure();return DB.purchases.filter(function(p){return p.supplierId===sid&&!p._deleted})
+  .sort(function(a,b){return String(a.date).localeCompare(String(b.date))})};
+window.supPays=function(sid){supEnsure();return DB.supplierPays.filter(function(p){return p.supplierId===sid&&!p._deleted})
+  .sort(function(a,b){return String(a.date).localeCompare(String(b.date))})};
+/* امانی تا وقتی قطعی نشده، بدهی محسوب نمی‌شود */
+window.purIsDebt=function(p){return !(p.terms==='\u0627\u0645\u0627\u0646\u06cc'&&!p.consignSettled)};
+window.supBought=function(sid){return supPurchases(sid).reduce(function(s,p){return s+purAmount(p)},0)};
+window.supDebtTotal=function(sid){return supPurchases(sid).filter(purIsDebt).reduce(function(s,p){return s+purAmount(p)},0)};
+/* چک برگشتی پرداخت محسوب نمی‌شود */
+window.spayCounts=function(p){return p.method!=='\u0686\u06a9'||p.chequeStatus!=='\u0628\u0631\u06af\u0634\u062a\u06cc'};
+window.supPaid=function(sid){return supPays(sid).filter(spayCounts).reduce(function(s,p){return s+(Number(p.amount)||0)},0)};
+window.supBalance=function(sid){return supDebtTotal(sid)-supPaid(sid)};
+window.supConsign=function(sid){return supPurchases(sid).filter(function(p){return p.terms==='\u0627\u0645\u0627\u0646\u06cc'&&!p.consignSettled})
+  .reduce(function(s,p){return s+purAmount(p)},0)};
+window.supChequeOpen=function(sid){return supPays(sid).filter(function(p){return p.method==='\u0686\u06a9'&&(p.chequeStatus||'\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646')==='\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646'})
+  .reduce(function(s,p){return s+(Number(p.amount)||0)},0)};
+window.supStatusText=function(sid){
+  var b=supBalance(sid),ch=supChequeOpen(sid);
+  if(b>0)return '\u0628\u062f\u0647\u06a9\u0627\u0631';
+  if(b<0)return '\u067e\u06cc\u0634\u200c\u067e\u0631\u062f\u0627\u062e\u062a';
+  return ch>0?'\u062a\u0633\u0648\u06cc\u0647 \u0628\u0627 \u0686\u06a9 \u062f\u0631 \u062c\u0631\u06cc\u0627\u0646':'\u062a\u0633\u0648\u06cc\u0647';
+};
+window.supStatusBadge=function(sid){var b=supBalance(sid);return b>0?'red':(b<0?'blue':'green')};
+window.purIdOf=function(p){return p?p.id:''};
+window.purFind=function(id){supEnsure();return DB.purchases.find(function(p){return p.id===id})||null};
+
+/* --- همهٔ چک‌ها --- */
+window.supAllCheques=function(){
+  supEnsure();
+  return DB.supplierPays.filter(function(p){return p.method==='\u0686\u06a9'&&!p._deleted})
+    .sort(function(a,b){return String(a.chequeDue||a.date).localeCompare(String(b.chequeDue||b.date))});
+};
+window.supChequeOverdue=function(c){
+  var st=c.chequeStatus||'\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646';
+  return st==='\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646'&&c.chequeDue&&String(c.chequeDue).slice(0,10)<todayISO().slice(0,10);
+};
+
+/* --- ساخت خرید از ورودهای کالا (بدون دوباره‌شماری) --- */
+window.supSyncFromEntries=function(silent){
+  supEnsure();
+  var skip=['\u0648\u0631\u0648\u062f \u0633\u0631\u06cc\u0639','\u0627\u0641\u0632\u0648\u062f\u0646 \u0633\u0631\u06cc\u0639','\u0645\u0648\u062c\u0648\u062f\u06cc \u0627\u0648\u0644\u06cc\u0647'];
+  var groups={},made=0,linked=0;
+  (DB.entries||[]).forEach(function(e){
+    if(e.purchaseId||e._noPurchase)return;
+    var nm=String(e.supplier||'').trim();
+    if(!nm||skip.indexOf(nm)>=0){e._noPurchase=true;return}
+    var d=String(e.date||todayISO()).slice(0,10);
+    var k=nm+'|'+d;
+    (groups[k]=groups[k]||[]).push(e);
+  });
+  Object.keys(groups).forEach(function(k){
+    var list=groups[k],nm=k.split('|')[0],d=k.split('|')[1];
+    var s=supByName(nm,true);
+    var amount=list.reduce(function(a,e){return a+((Number(e.buyPrice)||0)*(Number(e.qty)||0)+(Number(e.shippingTotal)||0))},0);
+    var qty=list.reduce(function(a,e){return a+(Number(e.qty)||0)},0);
+    DB.counters.purchase++;
+    var pur={id:uid(),number:'P-'+DB.counters.purchase,supplierId:s.id,date:d,
+      terms:s.defaultTerms||'\u0646\u0627\u0645\u0634\u062e\u0635',dueDate:'',amount:amount,qty:qty,
+      note:'\u0633\u0627\u062e\u062a\u0647\u200c\u0634\u062f\u0647 \u0627\u0632 \u0648\u0631\u0648\u062f \u06a9\u0627\u0644\u0627 ('+faNum(list.length)+' \u0631\u062f\u06cc\u0641)',
+      entryIds:list.map(function(e){return e.id}),fromEntries:true,createdBy:(session&&session.name)||'',createdAt:new Date().toISOString()};
+    DB.purchases.push(pur);made++;
+    list.forEach(function(e){e.purchaseId=pur.id;linked++});
+  });
+  if(made||linked)save();
+  if(!silent)toast(made?faNum(made)+' \u0633\u0646\u062f \u062e\u0631\u06cc\u062f \u0627\u0632 \u0648\u0631\u0648\u062f\u0647\u0627\u06cc \u06a9\u0627\u0644\u0627 \u0633\u0627\u062e\u062a\u0647 \u0634\u062f.':'\u0633\u0646\u062f \u062e\u0631\u06cc\u062f \u062c\u062f\u06cc\u062f\u06cc \u0644\u0627\u0632\u0645 \u0646\u0628\u0648\u062f.');
+  return {made:made,linked:linked};
+};
+
+/* --- کارخانه: تعریف / ویرایش --- */
+window.openSupplier=function(id){
+  supEnsure();
+  var s=id?supGet(id):null;
+  openModal('<h3>'+(s?'\u0648\u06cc\u0631\u0627\u06cc\u0634 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647':'\u06a9\u0627\u0631\u062e\u0627\u0646\u0647 / \u062a\u0623\u0645\u06cc\u0646\u200c\u06a9\u0646\u0646\u062f\u0647\u0654 \u062c\u062f\u06cc\u062f')+'</h3>'+
+    '<div class="field"><label>\u0646\u0627\u0645 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647</label><input id="sup-name" value="'+esc(s?s.name:'')+'" placeholder="\u0645\u062b\u0644\u0627\u064b \u0627\u0644\u06a9\u0648\u0627\u0633\u062a\u0648\u0646"></div>'+
+    '<div class="grid2"><div class="field"><label>\u062a\u0644\u0641\u0646</label><input id="sup-phone" value="'+esc(s?s.phone||'':'')+'"></div>'+
+    '<div class="field"><label>\u0646\u0648\u0639 \u062e\u0631\u06cc\u062f \u067e\u06cc\u0634\u200c\u0641\u0631\u0636</label><select id="sup-terms">'+
+      TERMS.map(function(t){return '<option '+((s&&s.defaultTerms===t)?'selected':'')+'>'+t+'</option>'}).join('')+'</select></div></div>'+
+    '<div class="field"><label>\u062a\u0648\u0636\u06cc\u062d</label><input id="sup-note" value="'+esc(s?s.note||'':'')+'"></div>'+
+    '<div class="actions"><button class="btn primary" onclick="saveSupplier('+(s?"'"+s.id+"'":'null')+')">\u0630\u062e\u06cc\u0631\u0647</button>'+
+    (s?'<button class="btn" onclick="openSupAccount(\''+s.id+'\')">\u062d\u0633\u0627\u0628 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647</button>':'')+
+    '<button class="btn" onclick="closeModal()">\u0627\u0646\u0635\u0631\u0627\u0641</button></div>');
+};
+window.saveSupplier=function(id){
+  supEnsure();
+  var nm=(document.querySelector('#sup-name').value||'').trim();
+  if(!nm){toast('\u0646\u0627\u0645 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647 \u0631\u0627 \u0648\u0627\u0631\u062f \u06a9\u0646\u06cc\u062f.');return}
+  var phone=(document.querySelector('#sup-phone').value||'').trim();
+  var terms=document.querySelector('#sup-terms').value;
+  var note=(document.querySelector('#sup-note').value||'').trim();
+  var s=id?supGet(id):null;
+  if(s){s.name=nm;s.phone=phone;s.defaultTerms=terms;s.note=note}
+  else{s={id:uid(),name:nm,phone:phone,defaultTerms:terms,note:note,createdAt:new Date().toISOString()};DB.suppliers.push(s)}
+  save();closeModal();rerender();
+  logAct('accounting',(id?'\u0648\u06cc\u0631\u0627\u06cc\u0634':'\u062b\u0628\u062a')+' \u06a9\u0627\u0631\u062e\u0627\u0646\u0647 \u00ab'+nm+'\u00bb');
+  toast('\u06a9\u0627\u0631\u062e\u0627\u0646\u0647 \u0630\u062e\u06cc\u0631\u0647 \u0634\u062f.');
+};
+
+/* --- ثبت / ویرایش خرید --- */
+window.openPurchase=function(id,sid){
+  supEnsure();
+  if(!supList().length){toast('\u0627\u0648\u0644 \u06cc\u06a9 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647 \u062a\u0639\u0631\u06cc\u0641 \u06a9\u0646\u06cc\u062f.');openSupplier();return}
+  var p=id?purFind(id):null;
+  var cur=p?p.supplierId:(sid||supList()[0].id);
+  openModal('<h3>'+(p?'\u0648\u06cc\u0631\u0627\u06cc\u0634 \u062e\u0631\u06cc\u062f '+esc(p.number):'\u062b\u0628\u062a \u062e\u0631\u06cc\u062f \u0627\u0632 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647')+'</h3>'+
+    '<div class="grid2"><div class="field"><label>\u06a9\u0627\u0631\u062e\u0627\u0646\u0647</label><select id="pu-sup">'+
+      supList().map(function(s){return '<option value="'+s.id+'" '+(s.id===cur?'selected':'')+'>'+esc(s.name)+'</option>'}).join('')+'</select></div>'+
+    '<div class="field"><label>\u0646\u0648\u0639 \u062e\u0631\u06cc\u062f</label><select id="pu-terms" onchange="purTermsChanged()">'+
+      TERMS.map(function(t){return '<option '+((p&&p.terms===t)?'selected':'')+'>'+t+'</option>'}).join('')+'</select></div></div>'+
+    '<div class="grid2"><div class="field"><label>\u0645\u0628\u0644\u063a \u062e\u0631\u06cc\u062f (\u062a\u0648\u0645\u0627\u0646)</label>'+
+      '<input id="pu-amount" inputmode="numeric" value="'+(p?Number(p.amount||0).toLocaleString('en-US'):'')+'" oninput="fmtPriceInput(this)"></div>'+
+    '<div class="field"><label>\u062a\u0639\u062f\u0627\u062f \u0648\u0631\u0642 (\u0627\u062e\u062a\u06cc\u0627\u0631\u06cc)</label><input id="pu-qty" inputmode="numeric" value="'+(p&&p.qty?p.qty:'')+'"></div></div>'+
+    '<div class="grid2"><div class="field"><label>\u062a\u0627\u0631\u06cc\u062e \u062e\u0631\u06cc\u062f</label><input id="pu-date" inputmode="numeric" value="'+(p&&p.date?faDate(p.date):todayJ())+'" oninput="jdInput(this)"></div>'+
+    '<div class="field" id="pu-due-wrap"><label>\u0633\u0631\u0631\u0633\u06cc\u062f / \u0645\u0647\u0644\u062a \u067e\u0631\u062f\u0627\u062e\u062a</label><input id="pu-due" inputmode="numeric" value="'+(p&&p.dueDate?faDate(p.dueDate):'')+'" oninput="jdInput(this)" placeholder="\u0627\u062e\u062a\u06cc\u0627\u0631\u06cc"></div></div>'+
+    '<div class="field"><label>\u062a\u0648\u0636\u06cc\u062d / \u0634\u0631\u062d \u0628\u0627\u0631</label><input id="pu-note" value="'+esc(p?p.note||'':'')+'"></div>'+
+    '<div class="notice blue">\u00ab\u0627\u0645\u0627\u0646\u06cc\u00bb \u062a\u0627 \u0648\u0642\u062a\u06cc \u0642\u0637\u0639\u06cc \u0646\u0634\u0648\u062f \u062c\u0632\u0621 \u0628\u062f\u0647\u06cc \u0634\u0645\u0627 \u0628\u0647 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647 \u062d\u0633\u0627\u0628 \u0646\u0645\u06cc\u200c\u0634\u0648\u062f.</div>'+
+    '<div class="actions"><button class="btn primary" onclick="savePurchase('+(p?"'"+p.id+"'":'null')+')">\u0630\u062e\u06cc\u0631\u0647</button>'+
+    (p?'<button class="btn" onclick="openSupPay(\''+p.supplierId+'\',\''+p.id+'\')">\u067e\u0631\u062f\u0627\u062e\u062a \u0628\u0647 \u0627\u06cc\u0646 \u062e\u0631\u06cc\u062f</button><button class="btn danger" onclick="purDelete(\''+p.id+'\')">\u062d\u0630\u0641</button>':'')+
+    '<button class="btn" onclick="closeModal()">\u0627\u0646\u0635\u0631\u0627\u0641</button></div>');
+  purTermsChanged();
+};
+window.purTermsChanged=function(){
+  var t=document.querySelector('#pu-terms'),w=document.querySelector('#pu-due-wrap');
+  if(!t||!w)return;
+  w.style.opacity=(t.value==='\u0646\u0642\u062f\u06cc')?'0.45':'1';
+};
+window.savePurchase=function(id){
+  supEnsure();
+  var sid=document.querySelector('#pu-sup').value;
+  var terms=document.querySelector('#pu-terms').value;
+  var amount=deNum(document.querySelector('#pu-amount').value)||0;
+  var qty=Math.max(0,Math.floor(deNum(document.querySelector('#pu-qty').value)||0));
+  var date=jdToISO(document.querySelector('#pu-date').value)||todayISO();
+  var due=jdToISO(document.querySelector('#pu-due').value)||'';
+  var note=(document.querySelector('#pu-note').value||'').trim();
+  if(!(amount>0)&&terms!=='\u0627\u0645\u0627\u0646\u06cc'){toast('\u0645\u0628\u0644\u063a \u062e\u0631\u06cc\u062f \u0631\u0627 \u0648\u0627\u0631\u062f \u06a9\u0646\u06cc\u062f.');return}
+  var p=id?purFind(id):null;
+  if(p){Object.assign(p,{supplierId:sid,terms:terms,amount:amount,qty:qty,date:date,dueDate:due,note:note,
+    editedBy:(session&&session.name)||'',editedAt:new Date().toISOString()})}
+  else{
+    DB.counters.purchase++;
+    p={id:uid(),number:'P-'+DB.counters.purchase,supplierId:sid,terms:terms,amount:amount,qty:qty,date:date,
+      dueDate:due,note:note,entryIds:[],createdBy:(session&&session.name)||'',createdAt:new Date().toISOString()};
+    DB.purchases.push(p);
+  }
+  save();closeModal();rerender();
+  logAct('accounting','\u062e\u0631\u06cc\u062f '+p.number+' \u0627\u0632 \u00ab'+supName(sid)+'\u00bb \u2014 '+fmt(amount)+' \u062a\u0648\u0645\u0627\u0646 ('+terms+')');
+  toast('\u062e\u0631\u06cc\u062f \u0630\u062e\u06cc\u0631\u0647 \u0634\u062f \u2014 \u0645\u0627\u0646\u062f\u0647\u0654 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647: '+fmt(supBalance(sid)));
+};
+window.purDelete=async function(id){
+  var p=purFind(id);if(!p)return;
+  if(!isManager()){toast('\u0641\u0642\u0637 \u0645\u062f\u06cc\u0631 \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u062d\u0630\u0641 \u06a9\u0646\u062f.');return}
+  if(!await uiConfirm('\u062e\u0631\u06cc\u062f '+p.number+' \u062d\u0630\u0641 \u0634\u0648\u062f\u061f'))return;
+  p._deleted=true;
+  (DB.entries||[]).forEach(function(e){if(e.purchaseId===p.id){e.purchaseId='';e._noPurchase=true}});
+  save();closeModal();rerender();
+  logAct('accounting','\u062d\u0630\u0641 \u062e\u0631\u06cc\u062f '+p.number);
+  toast('\u062e\u0631\u06cc\u062f \u062d\u0630\u0641 \u0634\u062f.');
+};
+window.purSettleConsign=async function(id){
+  var p=purFind(id);if(!p)return;
+  if(!await uiConfirm('\u0627\u06cc\u0646 \u0645\u062d\u0645\u0648\u0644\u0647\u0654 \u0627\u0645\u0627\u0646\u06cc \u0642\u0637\u0639\u06cc (\u062e\u0631\u06cc\u062f\u0627\u0631\u06cc \u0634\u062f\u0647) \u062b\u0628\u062a \u0634\u0648\u062f\u061f \u0645\u0628\u0644\u063a \u0628\u0647 \u0628\u062f\u0647\u06cc \u06a9\u0627\u0631\u062e\u0627\u0646\u0647 \u0627\u0636\u0627\u0641\u0647 \u0645\u06cc\u200c\u0634\u0648\u062f.'))return;
+  p.consignSettled=true;p.consignSettledAt=new Date().toISOString();
+  save();rerender();
+  logAct('accounting','\u0627\u0645\u0627\u0646\u06cc \u0642\u0637\u0639\u06cc \u0634\u062f: '+p.number);
+  toast('\u0645\u062d\u0645\u0648\u0644\u0647\u0654 \u0627\u0645\u0627\u0646\u06cc \u0642\u0637\u0639\u06cc \u0634\u062f \u2014 \u0645\u0627\u0646\u062f\u0647: '+fmt(supBalance(p.supplierId)));
+};
+
+/* --- پرداخت به کارخانه --- */
+window.openSupPay=function(sid,purId,payId){
+  supEnsure();
+  if(!supList().length){toast('\u0627\u0648\u0644 \u06cc\u06a9 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647 \u062a\u0639\u0631\u06cc\u0641 \u06a9\u0646\u06cc\u062f.');openSupplier();return}
+  var ex=payId?DB.supplierPays.find(function(x){return x.id===payId}):null;
+  var cur=ex?ex.supplierId:(sid||supList()[0].id);
+  var purs=supPurchases(cur).filter(function(p){return purIsDebt(p)});
+  openModal('<h3>'+(ex?'\u0648\u06cc\u0631\u0627\u06cc\u0634 \u067e\u0631\u062f\u0627\u062e\u062a '+esc(ex.number):'\u067e\u0631\u062f\u0627\u062e\u062a \u0628\u0647 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647')+'</h3>'+
+    '<div class="notice '+(supBalance(cur)>0?'orange':'green')+'" id="sp-bal">\u0645\u0627\u0646\u062f\u0647\u0654 \u062d\u0633\u0627\u0628 \u0628\u0627 '+esc(supName(cur))+': <b>'+fmt(Math.abs(supBalance(cur)))+' \u062a\u0648\u0645\u0627\u0646</b> '+supStatusText(cur)+'</div>'+
+    '<div class="grid2"><div class="field"><label>\u06a9\u0627\u0631\u062e\u0627\u0646\u0647</label><select id="sp-sup" onchange="supPayChanged()">'+
+      supList().map(function(s){return '<option value="'+s.id+'" '+(s.id===cur?'selected':'')+'>'+esc(s.name)+'</option>'}).join('')+'</select></div>'+
+    '<div class="field"><label>\u0645\u0628\u0644\u063a (\u062a\u0648\u0645\u0627\u0646)</label><input id="sp-amount" inputmode="numeric" value="'+(ex?Number(ex.amount||0).toLocaleString('en-US'):'')+'" oninput="fmtPriceInput(this)"></div></div>'+
+    '<div class="quick-exp" style="margin-bottom:8px"><button onclick="supPayFill(\'all\')">\u06a9\u0644 \u0645\u0627\u0646\u062f\u0647</button><button onclick="supPayFill(\'half\')">\u0646\u06cc\u0645\u06cc \u0627\u0632 \u0645\u0627\u0646\u062f\u0647</button></div>'+
+    '<div class="grid2"><div class="field"><label>\u0631\u0648\u0634 \u067e\u0631\u062f\u0627\u062e\u062a</label><select id="sp-method" onchange="supPayChanged()">'+
+      ['\u0646\u0642\u062f\u06cc','\u06a9\u0627\u0631\u062a','\u0648\u0627\u0631\u06cc\u0632 \u0628\u0627\u0646\u06a9\u06cc','\u0686\u06a9','\u0633\u0627\u06cc\u0631']
+        .map(function(m){return '<option '+((ex&&ex.method===m)?'selected':'')+'>'+m+'</option>'}).join('')+'</select></div>'+
+    '<div class="field"><label>\u062a\u0627\u0631\u06cc\u062e \u067e\u0631\u062f\u0627\u062e\u062a</label><input id="sp-date" inputmode="numeric" value="'+(ex&&ex.date?faDate(ex.date):todayJ())+'" oninput="jdInput(this)"></div></div>'+
+    '<div id="sp-cheque"></div>'+
+    '<div class="field"><label>\u0628\u0627\u0628\u062a \u062e\u0631\u06cc\u062f</label><select id="sp-pur"><option value="">\u2014 \u0628\u062f\u0648\u0646 \u0627\u062a\u0635\u0627\u0644 (\u062d\u0633\u0627\u0628 \u06a9\u0644\u06cc) \u2014</option>'+
+      purs.map(function(p){return '<option value="'+p.id+'" '+(((ex&&ex.purchaseId===p.id)||purId===p.id)?'selected':'')+'>'+esc(p.number)+' \u2014 '+faDate(p.date)+' \u2014 '+fmt(purAmount(p))+' ('+p.terms+')</option>'}).join('')+'</select></div>'+
+    '<div class="field"><label>\u062a\u0648\u0636\u06cc\u062d</label><input id="sp-note" value="'+esc(ex?ex.note||'':'')+'"></div>'+
+    '<div class="actions"><button class="btn primary" onclick="saveSupPay('+(ex?"'"+ex.id+"'":'null')+')">\u0630\u062e\u06cc\u0631\u0647</button>'+
+    (ex?'<button class="btn danger" onclick="supPayDelete(\''+ex.id+'\')">\u062d\u0630\u0641</button>':'')+
+    '<button class="btn" onclick="closeModal()">\u0627\u0646\u0635\u0631\u0627\u0641</button></div>');
+  window._spEdit=ex||null;
+  supPayChanged();
+};
+window.supPayChanged=function(){
+  var sel=document.querySelector('#sp-sup');if(!sel)return;
+  var sid=sel.value,ex=window._spEdit;
+  var bal=document.querySelector('#sp-bal');
+  if(bal)bal.innerHTML='\u0645\u0627\u0646\u062f\u0647\u0654 \u062d\u0633\u0627\u0628 \u0628\u0627 '+esc(supName(sid))+': <b>'+fmt(Math.abs(supBalance(sid)))+' \u062a\u0648\u0645\u0627\u0646</b> '+supStatusText(sid);
+  var m=document.querySelector('#sp-method'),box=document.querySelector('#sp-cheque');
+  if(m&&box){
+    box.innerHTML=(m.value==='\u0686\u06a9')?('<div class="grid2"><div class="field"><label>\u0634\u0645\u0627\u0631\u0647 \u0686\u06a9</label><input id="sp-chno" value="'+esc(ex?ex.chequeNo||'':'')+'"></div>'+
+      '<div class="field"><label>\u062a\u0627\u0631\u06cc\u062e \u0633\u0631\u0631\u0633\u06cc\u062f \u0686\u06a9</label><input id="sp-chdue" inputmode="numeric" value="'+(ex&&ex.chequeDue?faDate(ex.chequeDue):'')+'" oninput="jdInput(this)"></div></div>'+
+      '<div class="field"><label>\u0648\u0636\u0639\u06cc\u062a \u0686\u06a9</label><select id="sp-chst">'+
+      ['\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646','\u067e\u0627\u0633 \u0634\u062f\u0647','\u0628\u0631\u06af\u0634\u062a\u06cc']
+        .map(function(t){return '<option '+((ex&&ex.chequeStatus===t)?'selected':'')+'>'+t+'</option>'}).join('')+'</select></div>'):'';
+  }
+};
+window.supPayFill=function(mode){
+  var sid=document.querySelector('#sp-sup').value;
+  var bal=Math.max(0,supBalance(sid));
+  var v=mode==='half'?Math.round(bal/2):bal;
+  var el=document.querySelector('#sp-amount');
+  el.value=Number(v).toLocaleString('en-US');
+};
+window.saveSupPay=function(id){
+  supEnsure();
+  var sid=document.querySelector('#sp-sup').value;
+  var amount=deNum(document.querySelector('#sp-amount').value)||0;
+  if(!(amount>0)){toast('\u0645\u0628\u0644\u063a \u0631\u0627 \u0648\u0627\u0631\u062f \u06a9\u0646\u06cc\u062f.');return}
+  var method=document.querySelector('#sp-method').value;
+  var date=jdToISO(document.querySelector('#sp-date').value)||todayISO();
+  var purId=document.querySelector('#sp-pur').value||'';
+  var note=(document.querySelector('#sp-note').value||'').trim();
+  var chNo=(document.querySelector('#sp-chno')||{}).value||'';
+  var chDue=jdToISO(((document.querySelector('#sp-chdue')||{}).value)||'')||'';
+  var chSt=(document.querySelector('#sp-chst')||{}).value||'';
+  var ex=id?DB.supplierPays.find(function(x){return x.id===id}):null;
+  if(ex){
+    Object.assign(ex,{supplierId:sid,amount:amount,method:method,date:date,purchaseId:purId,note:note,
+      chequeNo:method==='\u0686\u06a9'?chNo:'',chequeDue:method==='\u0686\u06a9'?chDue:'',
+      chequeStatus:method==='\u0686\u06a9'?(chSt||'\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646'):'',
+      editedBy:(session&&session.name)||'',editedAt:new Date().toISOString()});
+    logAct('accounting','\u0648\u06cc\u0631\u0627\u06cc\u0634 \u067e\u0631\u062f\u0627\u062e\u062a \u06a9\u0627\u0631\u062e\u0627\u0646\u0647 '+ex.number);
+  }else{
+    DB.counters.spay++;
+    var p={id:uid(),number:'SP-'+DB.counters.spay,supplierId:sid,amount:amount,method:method,date:date,
+      purchaseId:purId,note:note,chequeNo:method==='\u0686\u06a9'?chNo:'',chequeDue:method==='\u0686\u06a9'?chDue:'',
+      chequeStatus:method==='\u0686\u06a9'?(chSt||'\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646'):'',
+      createdBy:(session&&session.name)||'',createdAt:new Date().toISOString()};
+    DB.supplierPays.push(p);
+    logAct('accounting','\u067e\u0631\u062f\u0627\u062e\u062a '+fmt(amount)+' \u062a\u0648\u0645\u0627\u0646 \u0628\u0647 \u00ab'+supName(sid)+'\u00bb ('+method+')');
+  }
+  save();closeModal();rerender();
+  toast('\u067e\u0631\u062f\u0627\u062e\u062a \u062b\u0628\u062a \u0634\u062f \u2014 \u0645\u0627\u0646\u062f\u0647\u0654 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647: '+fmt(supBalance(sid))+' ('+supStatusText(sid)+')');
+};
+window.supPayDelete=async function(id){
+  if(!isManager()){toast('\u0641\u0642\u0637 \u0645\u062f\u06cc\u0631 \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u062d\u0630\u0641 \u06a9\u0646\u062f.');return}
+  var p=DB.supplierPays.find(function(x){return x.id===id});if(!p)return;
+  if(!await uiConfirm('\u067e\u0631\u062f\u0627\u062e\u062a '+p.number+' \u062d\u0630\u0641 \u0634\u0648\u062f\u061f'))return;
+  p._deleted=true;save();closeModal();rerender();
+  logAct('accounting','\u062d\u0630\u0641 \u067e\u0631\u062f\u0627\u062e\u062a \u06a9\u0627\u0631\u062e\u0627\u0646\u0647 '+p.number);
+  toast('\u067e\u0631\u062f\u0627\u062e\u062a \u062d\u0630\u0641 \u0634\u062f.');
+};
+window.supChequeSet=function(id,st){
+  var p=DB.supplierPays.find(function(x){return x.id===id});if(!p)return;
+  p.chequeStatus=st;save();rerender();
+  logAct('accounting','\u0686\u06a9 '+(p.chequeNo||p.number)+' \u2192 '+st);
+  toast('\u0648\u0636\u0639\u06cc\u062a \u0686\u06a9: '+st);
+};
+
+/* --- حساب یک کارخانه --- */
+window.openSupAccount=function(sid){
+  supEnsure();
+  var s=supGet(sid);if(!s)return;
+  var purs=supPurchases(sid),pays=supPays(sid);
+  var evs=purs.map(function(p){return {d:p.date,t:'pur',o:p}})
+    .concat(pays.map(function(p){return {d:p.date,t:'pay',o:p}}))
+    .sort(function(a,b){return String(a.d).localeCompare(String(b.d))});
+  var run=0;
+  var rows=evs.map(function(e){
+    var o=e.o,debit=0,credit=0,label='';
+    if(e.t==='pur'){
+      debit=purIsDebt(o)?purAmount(o):0;
+      label='\u062e\u0631\u06cc\u062f '+esc(o.number)+' \u2014 '+o.terms+(o.qty?' \u2014 '+faNum(o.qty)+' \u0648\u0631\u0642':'')+
+        (o.terms==='\u0627\u0645\u0627\u0646\u06cc'&&!o.consignSettled?' <span class="badge blue">\u0627\u0645\u0627\u0646\u06cc \u2014 \u062c\u0632\u0621 \u0628\u062f\u0647\u06cc \u0646\u06cc\u0633\u062a</span>':'')+
+        (o.dueDate?' \u2014 \u0633\u0631\u0631\u0633\u06cc\u062f '+faDate(o.dueDate):'');
+    }else{
+      credit=spayCounts(o)?(Number(o.amount)||0):0;
+      label='\u067e\u0631\u062f\u0627\u062e\u062a '+esc(o.number)+' \u2014 '+o.method+
+        (o.method==='\u0686\u06a9'?' <span class="badge '+(o.chequeStatus==='\u067e\u0627\u0633 \u0634\u062f\u0647'?'green':o.chequeStatus==='\u0628\u0631\u06af\u0634\u062a\u06cc'?'red':'blue')+'">'+esc(o.chequeStatus||'\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646')+'</span>'+
+          (o.chequeNo?' \u0634\u0645\u0627\u0631\u0647 '+esc(o.chequeNo):'')+(o.chequeDue?' \u2014 \u0633\u0631\u0631\u0633\u06cc\u062f '+faDate(o.chequeDue):''):'')+
+        (o.purchaseId&&purFind(o.purchaseId)?' \u2014 \u0628\u0627\u0628\u062a '+esc(purFind(o.purchaseId).number):'');
+    }
+    run+=debit-credit;
+    return '<tr><td>'+faDate(e.d)+'</td><td>'+label+(o.note?'<div class="sub">'+esc(o.note)+'</div>':'')+'</td>'+
+      '<td class="num">'+(debit?fmt(debit):'\u2014')+'</td><td class="num">'+(credit?fmt(credit):'\u2014')+'</td>'+
+      '<td class="num"><b>'+fmt(Math.abs(run))+'</b></td>'+
+      '<td>'+(e.t==='pur'
+        ?'<button class="btn sm" onclick="openPurchase(\''+o.id+'\')">\u0648\u06cc\u0631\u0627\u06cc\u0634</button>'+
+          (o.terms==='\u0627\u0645\u0627\u0646\u06cc'&&!o.consignSettled?'<button class="btn sm" onclick="purSettleConsign(\''+o.id+'\')">\u0642\u0637\u0639\u06cc \u06a9\u0646</button>':'')
+        :'<button class="btn sm" onclick="openSupPay(null,null,\''+o.id+'\')">\u0648\u06cc\u0631\u0627\u06cc\u0634</button>')+'</td></tr>';
+  }).join('');
+  var bal=supBalance(sid);
+  openModal('<h3>\u062d\u0633\u0627\u0628 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647 \u2014 '+esc(s.name)+'</h3>'+
+    '<div class="pc-stocks">'+
+      '<div><span>\u062c\u0645\u0639 \u062e\u0631\u06cc\u062f</span><b class="num">'+fmt(supBought(sid))+'</b></div>'+
+      '<div><span>\u067e\u0631\u062f\u0627\u062e\u062a\u200c\u0634\u062f\u0647</span><b class="num">'+fmt(supPaid(sid))+'</b></div>'+
+      '<div><span>\u0627\u0645\u0627\u0646\u06cc \u0628\u0627\u0632</span><b class="num">'+fmt(supConsign(sid))+'</b></div>'+
+      '<div><span>\u0686\u06a9 \u062f\u0631 \u062c\u0631\u06cc\u0627\u0646</span><b class="num">'+fmt(supChequeOpen(sid))+'</b></div>'+
+      '<div><span>\u0645\u0627\u0646\u062f\u0647\u0654 \u062d\u0633\u0627\u0628</span><b class="num"><span class="badge '+supStatusBadge(sid)+'">'+fmt(Math.abs(bal))+' '+supStatusText(sid)+'</span></b></div>'+
+    '</div>'+
+    (s.phone?'<div class="sub">\u062a\u0644\u0641\u0646: '+esc(s.phone)+'</div>':'')+
+    (rows?'<div class="tblwrap" style="max-height:340px;overflow:auto"><table class="tbl"><thead><tr><th>\u062a\u0627\u0631\u06cc\u062e</th><th>\u0634\u0631\u062d</th><th>\u062e\u0631\u06cc\u062f (\u0628\u062f\u0647\u06a9\u0627\u0631)</th><th>\u067e\u0631\u062f\u0627\u062e\u062a</th><th>\u0645\u0627\u0646\u062f\u0647</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+      :'<div class="empty">\u0628\u0631\u0627\u06cc \u0627\u06cc\u0646 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647 \u062e\u0631\u06cc\u062f \u06cc\u0627 \u067e\u0631\u062f\u0627\u062e\u062a\u06cc \u062b\u0628\u062a \u0646\u0634\u062f\u0647 \u0627\u0633\u062a.</div>')+
+    '<div class="actions">'+
+      '<button class="btn primary" onclick="openPurchase(null,\''+sid+'\')">\u062b\u0628\u062a \u062e\u0631\u06cc\u062f</button>'+
+      '<button class="btn" onclick="openSupPay(\''+sid+'\')">\u067e\u0631\u062f\u0627\u062e\u062a \u0628\u0647 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647</button>'+
+      '<button class="btn" onclick="supExport(\''+sid+'\')">\u062e\u0631\u0648\u062c\u06cc \u0627\u06a9\u0633\u0644</button>'+
+      '<button class="btn" onclick="openSupplier(\''+sid+'\')">\u0648\u06cc\u0631\u0627\u06cc\u0634 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647</button>'+
+      '<button class="btn" onclick="closeModal()">\u0628\u0633\u062a\u0646</button></div>',true);
+};
+window.supExport=function(sid){
+  var s=supGet(sid);if(!s)return;
+  var rows=[['\u062d\u0633\u0627\u0628 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647',s.name],
+    ['\u062c\u0645\u0639 \u062e\u0631\u06cc\u062f',supBought(sid)],['\u067e\u0631\u062f\u0627\u062e\u062a\u200c\u0634\u062f\u0647',supPaid(sid)],
+    ['\u0627\u0645\u0627\u0646\u06cc \u0628\u0627\u0632',supConsign(sid)],['\u0686\u06a9 \u062f\u0631 \u062c\u0631\u06cc\u0627\u0646',supChequeOpen(sid)],
+    ['\u0645\u0627\u0646\u062f\u0647\u0654 \u062d\u0633\u0627\u0628',supBalance(sid),supStatusText(sid)],[],
+    ['\u0646\u0648\u0639','\u0634\u0645\u0627\u0631\u0647','\u062a\u0627\u0631\u06cc\u062e','\u0645\u0628\u0644\u063a','\u0646\u0648\u0639 \u062e\u0631\u06cc\u062f / \u0631\u0648\u0634','\u0648\u0636\u0639\u06cc\u062a \u0686\u06a9','\u0633\u0631\u0631\u0633\u06cc\u062f','\u062a\u0648\u0636\u06cc\u062d']];
+  supPurchases(sid).forEach(function(p){rows.push(['\u062e\u0631\u06cc\u062f',p.number,p.date,purAmount(p),p.terms,'',p.dueDate||'',p.note||''])});
+  supPays(sid).forEach(function(p){rows.push(['\u067e\u0631\u062f\u0627\u062e\u062a',p.number,p.date,p.amount,p.method,p.chequeStatus||'',p.chequeDue||'',p.note||''])});
+  dlCSV('\u062d\u0633\u0627\u0628-'+s.name+'.csv',rows);
+};
+
+/* --- تب کارخانه‌ها --- */
+window.accSuppliers=function(){
+  supEnsure();
+  var list=supList();
+  var tot={b:0,p:0,c:0,ch:0,bal:0};
+  list.forEach(function(s){tot.b+=supBought(s.id);tot.p+=supPaid(s.id);tot.c+=supConsign(s.id);tot.ch+=supChequeOpen(s.id);tot.bal+=supBalance(s.id)});
+  return '<div class="kpi-grid">'+
+    '<div class="kpi pri"><div class="lbl">\u062c\u0645\u0639 \u062e\u0631\u06cc\u062f \u0627\u0632 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647\u200c\u0647\u0627</div><div class="val">'+fmt(tot.b)+'</div><div class="sub2">'+faNum(list.length)+' \u06a9\u0627\u0631\u062e\u0627\u0646\u0647</div></div>'+
+    '<div class="kpi good"><div class="lbl">\u067e\u0631\u062f\u0627\u062e\u062a\u200c\u0634\u062f\u0647</div><div class="val">'+fmt(tot.p)+'</div></div>'+
+    '<div class="kpi bad"><div class="lbl">\u0628\u062f\u0647\u06cc \u0645\u0627 \u0628\u0647 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647\u200c\u0647\u0627</div><div class="val">'+fmt(tot.bal>0?tot.bal:0)+'</div></div>'+
+    '<div class="kpi"><div class="lbl">\u0627\u0645\u0627\u0646\u06cc \u0628\u0627\u0632</div><div class="val">'+fmt(tot.c)+'</div><div class="sub2">\u0686\u06a9 \u062f\u0631 \u062c\u0631\u06cc\u0627\u0646: '+fmt(tot.ch)+'</div></div></div>'+
+    '<div class="card"><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">'+
+      '<button class="btn primary" onclick="openPurchase()">\u062b\u0628\u062a \u062e\u0631\u06cc\u062f</button>'+
+      '<button class="btn" onclick="openSupPay()">\u067e\u0631\u062f\u0627\u062e\u062a \u0628\u0647 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647</button>'+
+      '<button class="btn" onclick="openSupplier()">\u06a9\u0627\u0631\u062e\u0627\u0646\u0647\u0654 \u062c\u062f\u06cc\u062f</button>'+
+      '<button class="btn" onclick="supSyncFromEntries()">\u0633\u0627\u062e\u062a \u062e\u0631\u06cc\u062f \u0627\u0632 \u0648\u0631\u0648\u062f\u0647\u0627\u06cc \u06a9\u0627\u0644\u0627</button>'+
+      '<button class="btn" onclick="supExportAll()">\u062e\u0631\u0648\u062c\u06cc \u0627\u06a9\u0633\u0644</button></div>'+
+    (list.length?'<div class="tblwrap"><table class="tbl"><thead><tr><th>\u06a9\u0627\u0631\u062e\u0627\u0646\u0647</th><th>\u062c\u0645\u0639 \u062e\u0631\u06cc\u062f</th><th>\u067e\u0631\u062f\u0627\u062e\u062a</th><th>\u0627\u0645\u0627\u0646\u06cc</th><th>\u0686\u06a9 \u062f\u0631 \u062c\u0631\u06cc\u0627\u0646</th><th>\u0645\u0627\u0646\u062f\u0647</th><th>\u0648\u0636\u0639\u06cc\u062a</th><th></th></tr></thead><tbody>'+
+      list.map(function(s){return '<tr><td><a href="javascript:void(0)" onclick="openSupAccount(\''+s.id+'\')"><b>'+esc(s.name)+'</b></a>'+
+        (s.defaultTerms&&s.defaultTerms!=='\u0646\u0627\u0645\u0634\u062e\u0635'?'<div class="sub">'+esc(s.defaultTerms)+'</div>':'')+'</td>'+
+        '<td class="num">'+fmt(supBought(s.id))+'</td><td class="num">'+fmt(supPaid(s.id))+'</td>'+
+        '<td class="num">'+fmt(supConsign(s.id))+'</td><td class="num">'+fmt(supChequeOpen(s.id))+'</td>'+
+        '<td class="num"><b>'+fmt(Math.abs(supBalance(s.id)))+'</b></td>'+
+        '<td><span class="badge '+supStatusBadge(s.id)+'">'+supStatusText(s.id)+'</span></td>'+
+        '<td><button class="btn sm" onclick="openSupAccount(\''+s.id+'\')">\u062d\u0633\u0627\u0628</button><button class="btn sm" onclick="openSupPay(\''+s.id+'\')">\u067e\u0631\u062f\u0627\u062e\u062a</button></td></tr>'}).join('')+
+      '</tbody></table></div>':'<div class="empty">\u0647\u0646\u0648\u0632 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647\u200c\u0627\u06cc \u062b\u0628\u062a \u0646\u0634\u062f\u0647. \u062f\u06a9\u0645\u0647\u0654 \u00ab\u06a9\u0627\u0631\u062e\u0627\u0646\u0647\u0654 \u062c\u062f\u06cc\u062f\u00bb \u06cc\u0627 \u00ab\u0633\u0627\u062e\u062a \u062e\u0631\u06cc\u062f \u0627\u0632 \u0648\u0631\u0648\u062f\u0647\u0627\u06cc \u06a9\u0627\u0644\u0627\u00bb.</div>')+'</div>';
+};
+window.supExportAll=function(){
+  supEnsure();
+  var rows=[['\u06a9\u0627\u0631\u062e\u0627\u0646\u0647','\u062c\u0645\u0639 \u062e\u0631\u06cc\u062f','\u067e\u0631\u062f\u0627\u062e\u062a\u200c\u0634\u062f\u0647','\u0627\u0645\u0627\u0646\u06cc \u0628\u0627\u0632','\u0686\u06a9 \u062f\u0631 \u062c\u0631\u06cc\u0627\u0646','\u0645\u0627\u0646\u062f\u0647','\u0648\u0636\u0639\u06cc\u062a','\u062a\u0644\u0641\u0646']];
+  supList().forEach(function(s){rows.push([s.name,supBought(s.id),supPaid(s.id),supConsign(s.id),supChequeOpen(s.id),supBalance(s.id),supStatusText(s.id),s.phone||''])});
+  dlCSV('\u06a9\u0627\u0631\u062e\u0627\u0646\u0647\u200c\u0647\u0627.csv',rows);
+};
+
+/* --- تب چک‌ها --- */
+window.accCheques=function(){
+  var chs=supAllCheques();
+  var open=chs.filter(function(c){return (c.chequeStatus||'\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646')==='\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646'});
+  var sumOpen=open.reduce(function(s,c){return s+(Number(c.amount)||0)},0);
+  var over=open.filter(supChequeOverdue);
+  return '<div class="kpi-grid">'+
+    '<div class="kpi pri"><div class="lbl">\u0686\u06a9 \u062f\u0631 \u062c\u0631\u06cc\u0627\u0646</div><div class="val">'+fmt(sumOpen)+'</div><div class="sub2">'+faNum(open.length)+' \u0641\u0642\u0631\u0647</div></div>'+
+    '<div class="kpi bad"><div class="lbl">\u0633\u0631\u0631\u0633\u06cc\u062f \u06af\u0630\u0634\u062a\u0647</div><div class="val">'+fmt(over.reduce(function(s,c){return s+(Number(c.amount)||0)},0))+'</div><div class="sub2">'+faNum(over.length)+' \u0641\u0642\u0631\u0647</div></div>'+
+    '<div class="kpi good"><div class="lbl">\u067e\u0627\u0633 \u0634\u062f\u0647</div><div class="val">'+fmt(chs.filter(function(c){return c.chequeStatus==='\u067e\u0627\u0633 \u0634\u062f\u0647'}).reduce(function(s,c){return s+(Number(c.amount)||0)},0))+'</div></div></div>'+
+    '<div class="card">'+(chs.length?'<div class="tblwrap"><table class="tbl"><thead><tr><th>\u0633\u0631\u0631\u0633\u06cc\u062f</th><th>\u06a9\u0627\u0631\u062e\u0627\u0646\u0647</th><th>\u0634\u0645\u0627\u0631\u0647 \u0686\u06a9</th><th>\u0645\u0628\u0644\u063a</th><th>\u0648\u0636\u0639\u06cc\u062a</th><th></th></tr></thead><tbody>'+
+      chs.map(function(c){var st=c.chequeStatus||'\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646';
+        return '<tr><td>'+(c.chequeDue?faDate(c.chequeDue):'\u2014')+(supChequeOverdue(c)?' <span class="badge red">\u0639\u0642\u0628\u200c\u0627\u0641\u062a\u0627\u062f\u0647</span>':'')+'</td>'+
+        '<td><a href="javascript:void(0)" onclick="openSupAccount(\''+c.supplierId+'\')">'+esc(supName(c.supplierId))+'</a></td>'+
+        '<td>'+esc(c.chequeNo||c.number)+'</td><td class="num">'+fmt(c.amount)+'</td>'+
+        '<td><span class="badge '+(st==='\u067e\u0627\u0633 \u0634\u062f\u0647'?'green':st==='\u0628\u0631\u06af\u0634\u062a\u06cc'?'red':'blue')+'">'+esc(st)+'</span></td>'+
+        '<td>'+(st==='\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646'?'<button class="btn sm" onclick="supChequeSet(\''+c.id+'\',\'\\u067e\\u0627\\u0633 \\u0634\\u062f\\u0647\')">\u067e\u0627\u0633 \u0634\u062f</button><button class="btn sm" onclick="supChequeSet(\''+c.id+'\',\'\\u0628\\u0631\\u06af\\u0634\\u062a\\u06cc\')">\u0628\u0631\u06af\u0634\u062a\u06cc</button>':'')+
+        '<button class="btn sm" onclick="openSupPay(null,null,\''+c.id+'\')">\u0648\u06cc\u0631\u0627\u06cc\u0634</button></td></tr>'}).join('')+
+      '</tbody></table></div>':'<div class="empty">\u0686\u06a9\u06cc \u062b\u0628\u062a \u0646\u0634\u062f\u0647 \u0627\u0633\u062a. \u0647\u0646\u06af\u0627\u0645 \u067e\u0631\u062f\u0627\u062e\u062a \u0628\u0647 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647\u060c \u0631\u0648\u0634 \u00ab\u0686\u06a9\u00bb \u0631\u0627 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f.</div>')+'</div>';
+};
+
+/* --- تب دفتر یکپارچه (همهٔ رویدادها) --- */
+window.accAllRows=function(r){
+  var inR=function(d){var x=String(d||'').slice(0,10);return (!r.from||x>=r.from)&&(!r.to||x<=r.to)};
+  var out=[];
+  (DB.invoices||[]).filter(function(v){return v.type==='invoice'&&v.status!=='\u0628\u0627\u0637\u0644\u200c\u0634\u062f\u0647'&&inR(v.date)}).forEach(function(v){
+    out.push({d:v.date,k:'\u0641\u0627\u06a9\u062a\u0648\u0631 \u0641\u0631\u0648\u0634',ref:String(v.number),
+      who:((getCust(v.customerId)||{}).name)||'\u2014',inn:invTotal(v),out:0,
+      note:v.status+(invRemain(v)>0?' \u2014 \u0645\u0627\u0646\u062f\u0647 '+fmt(invRemain(v)):''),go:"go('invoiceDetail','"+v.id+"')"});
+  });
+  (DB.payments||[]).filter(function(p){return inR(p.date)}).forEach(function(p){
+    out.push({d:p.date,k:'\u062f\u0631\u06cc\u0627\u0641\u062a \u0627\u0632 \u0645\u0634\u062a\u0631\u06cc',ref:String(p.number||''),
+      who:((getCust(p.customerId)||{}).name)||'\u2014',inn:0,out:0,cash:Number(p.amount)||0,
+      note:(p.method||'')+(p.invoiceNumber?' \u2014 \u0628\u0627\u0628\u062a \u0641\u0627\u06a9\u062a\u0648\u0631 '+faNum(p.invoiceNumber):' \u2014 \u062d\u0633\u0627\u0628 \u06a9\u0644\u06cc/\u067e\u06cc\u0634\u200c\u067e\u0631\u062f\u0627\u062e\u062a'),
+      go:"openCustAccount('"+p.customerId+"')"});
+  });
+  supEnsure();
+  DB.purchases.filter(function(p){return !p._deleted&&inR(p.date)}).forEach(function(p){
+    out.push({d:p.date,k:'\u062e\u0631\u06cc\u062f \u0627\u0632 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647',ref:p.number,who:supName(p.supplierId),
+      inn:0,out:purAmount(p),note:p.terms+(p.terms==='\u0627\u0645\u0627\u0646\u06cc'&&!p.consignSettled?' (\u062c\u0632\u0621 \u0628\u062f\u0647\u06cc \u0646\u06cc\u0633\u062a)':'')+(p.qty?' \u2014 '+faNum(p.qty)+' \u0648\u0631\u0642':''),
+      go:"openSupAccount('"+p.supplierId+"')"});
+  });
+  DB.supplierPays.filter(function(p){return !p._deleted&&inR(p.date)}).forEach(function(p){
+    out.push({d:p.date,k:'\u067e\u0631\u062f\u0627\u062e\u062a \u0628\u0647 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647',ref:p.number,who:supName(p.supplierId),
+      inn:0,out:0,cashOut:Number(p.amount)||0,
+      note:(p.method||'')+(p.method==='\u0686\u06a9'?' ('+(p.chequeStatus||'\u062f\u0631 \u062c\u0631\u06cc\u0627\u0646')+')':''),
+      go:"openSupAccount('"+p.supplierId+"')"});
+  });
+  (DB.expenses||[]).filter(function(e){return inR(e.date)}).forEach(function(e){
+    out.push({d:e.date,k:'\u0647\u0632\u06cc\u0646\u0647',ref:e.category||'',who:e.payee||'\u2014',inn:0,out:0,cashOut:Number(e.amount)||0,
+      note:e.note||'',go:"go('expenses')"});
+  });
+  return out.sort(function(a,b){return String(b.d).localeCompare(String(a.d))});
+};
+window.accAll=function(r){
+  var rows=accAllRows(r);
+  var t={sales:0,purch:0,cin:0,cout:0};
+  rows.forEach(function(x){t.sales+=x.inn||0;t.purch+=x.out||0;t.cin+=x.cash||0;t.cout+=x.cashOut||0});
+  var view=rows.slice(0,300);
+  return '<div class="kpi-grid">'+
+    '<div class="kpi pri"><div class="lbl">\u0641\u0631\u0648\u0634 (\u0641\u0627\u06a9\u062a\u0648\u0631\u0647\u0627)</div><div class="val">'+fmt(t.sales)+'</div></div>'+
+    '<div class="kpi good"><div class="lbl">\u062f\u0631\u06cc\u0627\u0641\u062a \u0627\u0632 \u0645\u0634\u062a\u0631\u06cc\u0627\u0646</div><div class="val">'+fmt(t.cin)+'</div></div>'+
+    '<div class="kpi bad"><div class="lbl">\u062e\u0631\u06cc\u062f \u0627\u0632 \u06a9\u0627\u0631\u062e\u0627\u0646\u0647\u200c\u0647\u0627</div><div class="val">'+fmt(t.purch)+'</div></div>'+
+    '<div class="kpi bad"><div class="lbl">\u067e\u0631\u062f\u0627\u062e\u062a\u06cc \u0648 \u0647\u0632\u06cc\u0646\u0647</div><div class="val">'+fmt(t.cout)+'</div><div class="sub2">\u062e\u0627\u0644\u0635 \u0646\u0642\u062f\u06cc: '+fmt(t.cin-t.cout)+'</div></div></div>'+
+    '<div class="card"><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">'+
+      '<button class="btn sm" onclick="accAllExport()">\u062e\u0631\u0648\u062c\u06cc \u0627\u06a9\u0633\u0644 \u062f\u0641\u062a\u0631 \u06a9\u0644</button>'+
+      '<span class="sub">'+faNum(rows.length)+' \u0631\u0648\u06cc\u062f\u0627\u062f'+(rows.length>view.length?' \u2014 \u0646\u0645\u0627\u06cc\u0634 '+faNum(view.length)+' \u0645\u0648\u0631\u062f \u0627\u062e\u06cc\u0631':'')+'</span></div>'+
+    (view.length?'<div class="tblwrap"><table class="tbl"><thead><tr><th>\u062a\u0627\u0631\u06cc\u062e</th><th>\u0646\u0648\u0639</th><th>\u0634\u0645\u0627\u0631\u0647</th><th>\u0637\u0631\u0641 \u062d\u0633\u0627\u0628</th><th>\u0641\u0631\u0648\u0634/\u062e\u0631\u06cc\u062f</th><th>\u0648\u0631\u0648\u062f \u0646\u0642\u062f</th><th>\u062e\u0631\u0648\u062c \u0646\u0642\u062f</th><th>\u0634\u0631\u062d</th></tr></thead><tbody>'+
+      view.map(function(x){return '<tr><td>'+faDate(x.d)+'</td><td>'+x.k+'</td>'+
+        '<td><a href="javascript:void(0)" onclick="'+x.go+'">'+esc(faNum(x.ref||'\u2014'))+'</a></td>'+
+        '<td>'+esc(x.who)+'</td><td class="num">'+((x.inn||x.out)?fmt(x.inn||x.out):'\u2014')+'</td>'+
+        '<td class="num">'+(x.cash?fmt(x.cash):'\u2014')+'</td><td class="num">'+(x.cashOut?fmt(x.cashOut):'\u2014')+'</td>'+
+        '<td class="sub">'+esc(x.note||'')+'</td></tr>'}).join('')+
+      '</tbody></table></div>':'<div class="empty">\u062f\u0631 \u0627\u06cc\u0646 \u062f\u0648\u0631\u0647 \u0631\u0648\u06cc\u062f\u0627\u062f\u06cc \u062b\u0628\u062a \u0646\u0634\u062f\u0647 \u0627\u0633\u062a.</div>')+'</div>';
+};
+window.accAllExport=function(){
+  var r=periodRange(typeof accPeriod!=='undefined'?accPeriod:'month');
+  var rows=[['\u062a\u0627\u0631\u06cc\u062e','\u0646\u0648\u0639','\u0634\u0645\u0627\u0631\u0647','\u0637\u0631\u0641 \u062d\u0633\u0627\u0628','\u0641\u0631\u0648\u0634/\u062e\u0631\u06cc\u062f','\u0648\u0631\u0648\u062f \u0646\u0642\u062f','\u062e\u0631\u0648\u062c \u0646\u0642\u062f','\u0634\u0631\u062d']];
+  accAllRows(r).forEach(function(x){rows.push([x.d,x.k,x.ref,x.who,x.inn||x.out||0,x.cash||0,x.cashOut||0,x.note||''])});
+  dlCSV('\u062f\u0641\u062a\u0631-\u06a9\u0644-'+r.label+'.csv',rows);
+};
+
+/* --- افزودن تب‌ها به صفحهٔ حسابداری --- */
+var MY_TABS=[['sup','\u06a9\u0627\u0631\u062e\u0627\u0646\u0647\u200c\u0647\u0627 \u0648 \u062e\u0631\u06cc\u062f'],['cheque','\u0686\u06a9\u200c\u0647\u0627'],['all','\u062f\u0641\u062a\u0631 \u06a9\u0644 \u06cc\u06a9\u067e\u0627\u0631\u0686\u0647']];
+function myTabButtons(){
+  return MY_TABS.map(function(t){return '<button class="'+(accTab===t[0]?'active':'')+'" onclick="accTab=\''+t[0]+'\';rerender()">'+t[1]+'</button>'}).join('');
+}
+var _o_pageAccounting20=window.pageAccounting;
+window.pageAccounting=function(){
+  supEnsure();
+  var mine=MY_TABS.some(function(t){return t[0]===accTab});
+  var keep=accTab;
+  if(mine)accTab='pnl';
+  var html;
+  try{html=String(_o_pageAccounting20.apply(this,arguments))}finally{accTab=keep}
+  if(html.indexOf('bigtabs')<0)return html;
+  /* دکمهٔ تب‌های جدید */
+  var i=html.indexOf('<div class="bigtabs"');
+  var j=html.indexOf('</div>',i);
+  html=html.slice(0,j)+myTabButtons()+html.slice(j);
+  if(mine){
+    var r=periodRange(accPeriod);
+    var body=accTab==='sup'?accSuppliers():accTab==='cheque'?accCheques():accAll(r);
+    var k=html.indexOf('</div>',html.indexOf('<div class="bigtabs"'));
+    html=html.slice(0,k+6)+body;
+  }
+  return html;
+};
+
+/* --- تأمین‌کننده در تخلیهٔ کامیون ← ساخت خرید خودکار --- */
+if(typeof window.saveTruck==='function'){
+  var _o_saveTruck20=window.saveTruck;
+  window.saveTruck=function(){
+    var res=_o_saveTruck20.apply(this,arguments);
+    try{supSyncFromEntries(true)}catch(e){}
+    return res;
+  };
+}
+
+})();
+
+
+/* ===== ROUND 21: حذف مرحلهٔ پرداخت از فاکتور — تسویه در صفحهٔ مشتری ===== */
+(function(){
+
+/* --- تنطیم: بعد از ثبت، رفتن به صفحهٔ مشتری --- */
+window.invGoCustOn=function(){
+  if(!DB.settings)DB.settings={};
+  return DB.settings.invGoCustomer!==false;
+};
+window.invSetGoCust=function(on){
+  if(!DB.settings)DB.settings={};
+  DB.settings.invGoCustomer=!!on;
+  save();
+  toast(on?'\u0628\u0639\u062f \u0627\u0632 \u062b\u0628\u062a\u060c \u0635\u0641\u062d\u0647\u0654 \u0645\u0634\u062a\u0631\u06cc \u0628\u0627\u0632 \u0645\u06cc\u200c\u0634\u0648\u062f.':'\u0628\u0639\u062f \u0627\u0632 \u062b\u0628\u062a\u060c \u062e\u0648\u062f \u0641\u0627\u06a9\u062a\u0648\u0631 \u0628\u0627\u0632 \u0645\u06cc\u200c\u0634\u0648\u062f.');
+};
+
+/* --- کارت جدید جای گزینه‌های پرداخت --- */
+function payCardHTML(){
+  var cid=(typeof draft!=='undefined'&&draft)?draft.customerId:null;
+  var c=cid&&typeof getCust==='function'?getCust(cid):null;
+  var cr=0;try{cr=cid&&typeof preCredit==='function'?preCredit(cid):0}catch(e){}
+  var bal=0;try{bal=cid&&typeof custBalance==='function'?custBalance(cid):0}catch(e){}
+  var on=invGoCustOn();
+  return '<div class="card"><h3>\u06f4. \u067e\u0631\u062f\u0627\u062e\u062a \u0648 \u062a\u0633\u0648\u06cc\u0647</h3>'+
+    '<div class="notice blue">\u067e\u0631\u062f\u0627\u062e\u062a \u0646\u0642\u062f\u06cc\u060c \u0648\u0627\u0631\u06cc\u0632 \u0628\u0627\u0646\u06a9\u06cc\u060c \u0686\u06a9 \u0648 \u067e\u0631\u062f\u0627\u062e\u062a \u0628\u062e\u0634\u06cc <b>\u062f\u0631 \u0635\u0641\u062d\u0647\u0654 \u062d\u0633\u0627\u0628 \u0645\u0634\u062a\u0631\u06cc</b> \u062b\u0628\u062a \u0645\u06cc\u200c\u0634\u0648\u062f. \u0641\u0627\u06a9\u062a\u0648\u0631 \u0631\u0627 \u062b\u0628\u062a \u06a9\u0646\u06cc\u062f\u061b \u0628\u0644\u0627\u0641\u0627\u0635\u0644\u0647 \u0628\u0647 \u062d\u0633\u0627\u0628 \u0645\u0634\u062a\u0631\u06cc \u0645\u06cc\u200c\u0631\u0648\u06cc\u062f \u0648 \u0647\u0645\u0627\u0646\u062c\u0627 \u062f\u0631\u06cc\u0627\u0641\u062a \u0631\u0627 \u0645\u06cc\u200c\u0632\u0646\u06cc\u062f.</div>'+
+    (c?'<div class="sumline"><span>\u0645\u0627\u0646\u062f\u0647\u0654 \u0641\u0639\u0644\u06cc '+esc(c.name)+'</span><b class="num">'+
+        (bal>0?fmt(bal)+' \u0628\u062f\u0647\u06a9\u0627\u0631':(bal<0?fmt(-bal)+' \u0628\u0633\u062a\u0627\u0646\u06a9\u0627\u0631':'\u0635\u0641\u0631'))+'</b></div>':'')+
+    (cr>0?'<div class="notice green">\u0627\u06cc\u0646 \u0645\u0634\u062a\u0631\u06cc <b>'+fmt(cr)+' \u062a\u0648\u0645\u0627\u0646</b> \u067e\u06cc\u0634\u200c\u067e\u0631\u062f\u0627\u062e\u062a \u062f\u0627\u0631\u062f \u06a9\u0647 \u067e\u0633 \u0627\u0632 \u062b\u0628\u062a\u060c \u062e\u0648\u062f\u06a9\u0627\u0631 \u0631\u0648\u06cc \u0627\u06cc\u0646 \u0641\u0627\u06a9\u062a\u0648\u0631 \u0627\u0639\u0645\u0627\u0644 \u0645\u06cc\u200c\u0634\u0648\u062f.</div>':'')+
+    '<label class="chk" style="display:flex;gap:8px;align-items:center;margin-top:6px">'+'<input type="checkbox" '+((window.prePayAuto!==false)?'checked':'')+' onchange="prePaySetAuto(this.checked)">'+'<span>پیش‌پرداخت مشتری خودکار روی این فاکتور اعمال شود</span></label>'+
+    '<label class="chk" style="display:flex;gap:8px;align-items:center;margin-top:6px">'+
+      '<input type="checkbox" '+(on?'checked':'')+' onchange="invSetGoCust(this.checked)">'+
+      '<span>\u0628\u0639\u062f \u0627\u0632 \u062b\u0628\u062a\u060c \u0635\u0641\u062d\u0647\u0654 \u062d\u0633\u0627\u0628 \u0645\u0634\u062a\u0631\u06cc \u0628\u0627\u0632 \u0634\u0648\u062f</span></label>'+
+    (c?'<div class="actions" style="margin-top:8px"><button class="btn sm" onclick="openCustAccount(\''+cid+'\')">\u062d\u0633\u0627\u0628 \u0645\u0634\u062a\u0631\u06cc</button></div>':'')+
+    '</div>';
+}
+
+var _o_pageNewInvoice21=window.pageNewInvoice;
+window.pageNewInvoice=function(){
+  /* فاکتور همیشه بدون دریافت ثبت می‌شود */
+  try{
+    if(typeof draft!=='undefined'&&draft){draft.payMode='later';draft.received=0}
+    if(window.SalesCart&&SalesCart.getCart){var k=SalesCart.getCart();k.paymentType='credit';k.received=0}
+  }catch(e){}
+  var html=String(_o_pageNewInvoice21.apply(this,arguments));
+  var mk='<h3>\u06f4. \u067e\u0631\u062f\u0627\u062e\u062a</h3>';
+  var i=html.indexOf(mk);
+  if(i<0)return html;
+  var cs=html.lastIndexOf('<div class="card">',i);
+  var be=html.indexOf('<div style="display:flex;gap:10px;margin-top:18px',i);
+  if(cs<0||be<=cs)return html;
+  return html.slice(0,cs)+payCardHTML()+'\n\n  '+html.slice(be);
+};
+
+/* --- ثبت فاکتور: همیشه بدون دریافت، سپس رفتن به حساب مشتری --- */
+var _o_saveInvoice21=window.saveInvoice;
+window.saveInvoice=function(){
+  try{
+    if(typeof draft!=='undefined'&&draft){draft.payMode='later';draft.received=0}
+    if(window.SalesCart&&SalesCart.setPaymentType)SalesCart.setPaymentType('credit');
+    if(window.SalesCart&&SalesCart.getCart){var k=SalesCart.getCart();k.received=0}
+    if(typeof draft!=='undefined'&&draft)draft.payMode='later';
+  }catch(e){}
+  window._invSaveFlag=true;
+  setTimeout(function(){window._invSaveFlag=false},15000);
+  return _o_saveInvoice21.apply(this,arguments);
+};
+
+var _o_go21=window.go;
+window.go=function(page,param){
+  if(window._invSaveFlag&&page==='invoiceDetail'){
+    window._invSaveFlag=false;
+    var v=(DB.invoices||[]).find(function(x){return x.id===param});
+    if(v&&v.customerId&&invGoCustOn()){
+      var res=_o_go21.call(this,'customerDetail',v.customerId);
+      setTimeout(function(){try{invAfterSave(v.id,v.customerId)}catch(e){}},280);
+      return res;
+    }
+  }
+  return _o_go21.apply(this,arguments);
+};
+
+/* --- پنل پس از ثبت فاکتور --- */
+window.invAfterSave=function(invId,cid){
+  var v=(DB.invoices||[]).find(function(x){return x.id===invId});
+  if(!v)return;
+  var c=getCust(cid)||{name:'\u2014'};
+  var isPro=v.type==='proforma';
+  var tot=invTotal(v),paid=invPaid(v),rem=invRemain(v);
+  var cr=0;try{cr=typeof preCredit==='function'?preCredit(cid):0}catch(e){}
+  var bal=0;try{bal=custBalance(cid)}catch(e){}
+  openModal('<h3>'+(isPro?'\u067e\u06cc\u0634\u200c\u0641\u0627\u06a9\u062a\u0648\u0631':'\u0641\u0627\u06a9\u062a\u0648\u0631')+' '+faNum(String(v.number))+' \u062b\u0628\u062a \u0634\u062f</h3>'+
+    '<div class="notice green">\u0645\u0634\u062a\u0631\u06cc: <b>'+esc(c.name)+'</b> \u2014 \u0627\u06a9\u0646\u0648\u0646 \u062f\u0631 \u0635\u0641\u062d\u0647\u0654 \u0647\u0645\u06cc\u0646 \u0645\u0634\u062a\u0631\u06cc \u0647\u0633\u062a\u06cc\u062f\u061b \u062f\u0631\u06cc\u0627\u0641\u062a \u0648 \u0648\u0627\u0631\u06cc\u0632\u06cc \u0631\u0627 \u0627\u06cc\u0646\u062c\u0627 \u062b\u0628\u062a \u06a9\u0646\u06cc\u062f.</div>'+
+    '<div class="pc-stocks">'+
+      '<div><span>\u0645\u0628\u0644\u063a '+(isPro?'\u067e\u06cc\u0634\u200c\u0641\u0627\u06a9\u062a\u0648\u0631':'\u0641\u0627\u06a9\u062a\u0648\u0631')+'</span><b class="num">'+fmt(tot)+'</b></div>'+
+      '<div><span>\u062f\u0631\u06cc\u0627\u0641\u062a\u200c\u0634\u062f\u0647</span><b class="num">'+fmt(paid)+'</b></div>'+
+      '<div><span>\u0645\u0627\u0646\u062f\u0647\u0654 \u0627\u06cc\u0646 \u0633\u0646\u062f</span><b class="num">'+fmt(rem)+'</b></div>'+
+      '<div><span>\u0645\u0627\u0646\u062f\u0647\u0654 \u06a9\u0644 \u0645\u0634\u062a\u0631\u06cc</span><b class="num">'+(bal>0?fmt(bal)+' \u0628\u062f\u0647\u06a9\u0627\u0631':(bal<0?fmt(-bal)+' \u0628\u0633\u062a\u0627\u0646\u06a9\u0627\u0631':'\u0635\u0641\u0631'))+'</b></div>'+
+    '</div>'+
+    (cr>0?'<div class="notice blue">\u067e\u06cc\u0634\u200c\u067e\u0631\u062f\u0627\u062e\u062a \u0628\u0627\u0642\u06cc\u0645\u0627\u0646\u062f\u0647: <b>'+fmt(cr)+' \u062a\u0648\u0645\u0627\u0646</b></div>':'')+
+    '<div class="actions">'+
+      (rem>0?'<button class="btn primary" onclick="invPayNow(\''+invId+'\',\''+cid+'\')">\u062b\u0628\u062a \u062f\u0631\u06cc\u0627\u0641\u062a / \u0648\u0627\u0631\u06cc\u0632</button>':'')+
+      '<button class="btn" onclick="closeModal();openCustAccount(\''+cid+'\')">\u062d\u0633\u0627\u0628 \u0648 \u0635\u0648\u0631\u062a\u200c\u062d\u0633\u0627\u0628</button>'+
+      '<button class="btn" onclick="closeModal();go(\'invoiceDetail\',\''+invId+'\')">\u0645\u0634\u0627\u0647\u062f\u0647\u0654 \u0633\u0646\u062f</button>'+
+      '<button class="btn" onclick="closeModal()">\u0628\u0633\u062a\u0646</button></div>');
+};
+window.invPayNow=function(invId,cid){
+  closeModal();
+  openPayment(cid);
+  setTimeout(function(){
+    var s=document.querySelector('#pm-inv');
+    if(s){
+      var ok=Array.prototype.some.call(s.options,function(o){return o.value===invId});
+      if(ok){s.value=invId;if(window.payFill)payFill('inv');else if(window.payPreview)payPreview()}
+    }
+    if(window.payPreview)payPreview();
+  },140);
+};
+
+})();
+
+
+/* ================= ROUND 22: ویرایش مشتری + انتخاب کامل قفسه + حذف تعداد اقلام ================= */
+(function(){
+
+  /* ---------- 1) ویرایش اطلاعات مشتری (مدیر) ---------- */
+  function canEditCust(){
+    try{ if(typeof isManager==="function" && isManager()) return true; }catch(e){}
+    try{ if(PermissionService.hasPermission("customer.edit")) return true; }catch(e){}
+    try{ if(PermissionService.hasPermission("customers.edit")) return true; }catch(e){}
+    try{ return !!(session && session.role==="manager"); }catch(e){}
+    return false;
+  }
+  window.canEditCust = canEditCust;
+
+  window.openCustEdit = function(cid){
+    if(!canEditCust()){ toast("ویرایش اطلاعات مشتری فقط توسط مدیر امکان‌پذیر است."); return; }
+    var c = getCust(cid);
+    if(!c){ toast("مشتری پیدا نشد."); return; }
+    var bal = 0; try{ bal = custBalance(c.id); }catch(e){}
+    openModal('<h3>ویرایش اطلاعات مشتری</h3>'
+      + '<div class="sub">مانده فعلی حساب: <b class="num">'+fmt(bal)+'</b> تومان</div>'
+      + '<div class="field"><label>نام *</label><input id="ce-name" value="'+esc(c.name||"")+'"></div>'
+      + '<div class="field"><label>موبایل *</label><input id="ce-phone" inputmode="tel" dir="ltr" value="'+esc(c.phone||"")+'" oninput="this.value=latinDigits(this.value).replace(/[^0-9]/g,\'\')"></div>'
+      + '<div class="field"><label>آدرس</label><input id="ce-addr" value="'+esc(c.address||"")+'"></div>'
+      + '<div class="grid2">'
+      + '<div class="field"><label>سقف اعتبار (تومان — خالی = بدون محدودیت)</label>'
+      + '<input id="ce-credit" inputmode="numeric" dir="ltr" value="'+(c.creditLimit?esc(String(c.creditLimit)):"")+'" oninput="fmtPriceInput(this)"></div>'
+      + '<div class="field"><label>ماندهٔ اولیه / بدهکاری قبلی</label>'
+      + '<input id="ce-open" inputmode="numeric" dir="ltr" value="'+(c.openingBalance?esc(String(c.openingBalance)):"")+'" oninput="fmtPriceInput(this)"></div>'
+      + '</div>'
+      + '<div class="field"><label>یادداشت</label><input id="ce-note" value="'+esc(c.note||"")+'"></div>'
+      + '<div class="actions"><button class="btn primary" onclick="saveCustEdit(\''+c.id+'\')">ذخیرهٔ تغییرات</button>'
+      + '<button class="btn" onclick="closeModal()">انصراف</button></div>');
+  };
+
+  window.saveCustEdit = function(cid){
+    if(!canEditCust()) return;
+    var c = getCust(cid); if(!c) return;
+    function val(id){ var el=document.getElementById(id); return el?String(el.value||"").trim():""; }
+    var name = val("ce-name"), phone = val("ce-phone");
+    if(!name || !phone){ toast("نام و موبایل الزامی است."); return; }
+    var dup = (DB.customers||[]).filter(function(x){ return x.id!==c.id && String(x.phone||"")===phone; });
+    if(dup.length){ toast("مشتری دیگری با این شماره موبایل وجود دارد."); return; }
+    var before = { name:c.name, phone:c.phone, address:c.address, creditLimit:c.creditLimit, openingBalance:c.openingBalance, note:c.note };
+    var cl = deNum(val("ce-credit"))||0, ob = deNum(val("ce-open"))||0;
+    c.name = name; c.phone = phone; c.address = val("ce-addr"); c.note = val("ce-note");
+    if(cl>0) c.creditLimit = cl; else delete c.creditLimit;
+    if(ob>0) c.openingBalance = ob; else delete c.openingBalance;
+    try{ c.editedBy = (session&&session.name)||""; c.editedAt = Date.now(); }catch(e){}
+    var chg = [];
+    if(before.name!==c.name) chg.push("نام");
+    if(before.phone!==c.phone) chg.push("موبایل");
+    if((before.address||"")!==(c.address||"")) chg.push("آدرس");
+    if((before.creditLimit||0)!==(c.creditLimit||0)) chg.push("سقف اعتبار");
+    if((before.openingBalance||0)!==(c.openingBalance||0)) chg.push("ماندهٔ اولیه");
+    save();
+    try{ logAct("customer", "ویرایش مشتری «"+c.name+"»" + (chg.length?" — "+chg.join("، "):"")); }catch(e){}
+    try{ auditLog("customer_edit", "ویرایش مشتری «"+c.name+"»", before, c, {module:"customers"}); }catch(e){}
+    closeModal(); render(); toast("اطلاعات مشتری ذخیره شد.");
+  };
+
+  /* دکمهٔ ویرایش در صفحهٔ مشتری */
+  if(typeof pageCustomerDetail==="function"){
+    var _o_pcd22 = pageCustomerDetail;
+    pageCustomerDetail = function(){
+      var h = _o_pcd22.apply(this, arguments);
+      if(typeof h!=="string" || !canEditCust()) return h;
+      var cid = ""; try{ cid = route.param||""; }catch(e){}
+      if(!cid) return h;
+      var btn = '<button class="btn sm" onclick="openCustEdit(\''+cid+'\')">✏️ ویرایش اطلاعات</button>';
+      var anchor = '<button class="btn sm" onclick="go(\'customers\')">';
+      var i = h.indexOf(anchor);
+      if(i>=0) return h.slice(0,i) + btn + h.slice(i);
+      return btn + h;
+    };
+  }
+
+  /* دکمهٔ ویرایش روی کارت‌های لیست مشتریان */
+  if(typeof pageCustomers==="function"){
+    var _o_pcs22 = pageCustomers;
+    pageCustomers = function(){
+      var h = _o_pcs22.apply(this, arguments);
+      if(typeof h!=="string" || !canEditCust()) return h;
+      return h.replace(/<div class="ccard" onclick="go\('customerDetail','([^']+)'\)">/g, function(m, id){
+        return m + '<button class="btn sm" style="position:absolute;top:8px;left:8px;z-index:3" '
+          + 'onclick="event.stopPropagation();openCustEdit(\''+id+'\')">✏️</button>';
+      }).replace('<div class="cgrid">', '<style>.cgrid .ccard{position:relative}</style><div class="cgrid">');
+    };
+  }
+
+  /* ---------- 2) انتخاب قفسه/گروه = همهٔ موجودی ورق‌ها ---------- */
+  function pickFullOn(){
+    try{ return !(DB.settings && DB.settings.ssPickOne===true); }catch(e){ return true; }
+  }
+  window.ssPickFullOn = pickFullOn;
+  window.ssSetPickMode = function(one){
+    try{ DB.settings = DB.settings||{}; DB.settings.ssPickOne = !!one; save(); }catch(e){}
+    toast(one ? "انتخاب هر ردیف: ۱ ورق" : "انتخاب هر ردیف: همهٔ موجودی");
+    try{ render(); }catch(e){}
+  };
+
+  function availOf(p){ try{ return Number(ssAvail(p))||0; }catch(e){ return 0; } }
+
+  /* انتخاب تکی: پیش‌فرض همهٔ موجودی همان ردیف */
+  if(typeof ssPick==="function"){
+    var _o_ssPick22 = ssPick;
+    ssPick = function(pid){
+      var p = null; try{ p = getProd(pid); }catch(e){}
+      if(!p) return _o_ssPick22.apply(this, arguments);
+      if(ssSel[pid]){ delete ssSel[pid]; }
+      else {
+        var a = availOf(p);
+        ssSel[pid] = (pickFullOn() && a>0) ? a : 1;
+      }
+      render();
+    };
+  }
+
+  /* انتخاب همهٔ نمایش‌داده‌شده‌ها = تمام موجودی */
+  if(typeof ssSelectAllVisible==="function"){
+    ssSelectAllVisible = function(){
+      var n=0, sheets=0;
+      ssList().forEach(function(p){
+        var a = availOf(p);
+        if(a>0){ ssSel[p.id] = a; n++; sheets+=a; }
+      });
+      render();
+      toast(faNum(n)+" ردیف — در مجموع "+faNum(sheets)+" ورق انتخاب شد.");
+    };
+  }
+
+  /* انتخاب کل یک قفسه */
+  window.ssSelectShelfFull = function(name){
+    var sh = String(name||"").trim();
+    if(!sh){ toast("ابتدا قفسه را انتخاب کنید."); return; }
+    var n=0, sheets=0;
+    (DB.products||[]).forEach(function(p){
+      var ok = false;
+      try{ ok = ssShelfMatch(p, sh); }catch(e){ ok = String(p.shelf||"").trim()===sh; }
+      if(!ok) return;
+      var a = availOf(p);
+      if(a>0){ ssSel[p.id] = a; n++; sheets+=a; }
+    });
+    render();
+    toast(n ? ("قفسهٔ "+sh+": "+faNum(n)+" ردیف / "+faNum(sheets)+" ورق انتخاب شد.") : "در این قفسه موجودی نیست.");
+  };
+
+  /* پرکردن ردیف‌های انتخاب‌شده تا سقف موجودی */
+  window.ssFillSelectedToAvail = function(){
+    var ids = Object.keys(ssSel||{});
+    if(!ids.length){ toast("ردیفی انتخاب نشده است."); return; }
+    var sheets=0;
+    ids.forEach(function(id){
+      var p=null; try{ p=getProd(id); }catch(e){}
+      if(!p) return;
+      var a = availOf(p);
+      if(a>0){ ssSel[id]=a; sheets+=a; } else { delete ssSel[id]; }
+    });
+    render();
+    toast("مقدار همهٔ ردیف‌ها روی موجودی تنطیم شد — "+faNum(sheets)+" ورق.");
+  };
+
+  /* دکمه‌های جدید در نوار ابزار صفحهٔ انتخاب ورق */
+  if(typeof pageSheetSelect==="function"){
+    var _o_pss22 = pageSheetSelect;
+    pageSheetSelect = function(){
+      var h = _o_pss22.apply(this, arguments);
+      if(typeof h!=="string") return h;
+      var anchor = 'onclick="ssSelectAllVisible()"';
+      var i = h.indexOf(anchor);
+      if(i<0) return h;
+      var end = h.indexOf('</button>', i);
+      if(end<0) return h;
+      end += 9;
+      var sh = ""; try{ sh = String(ssF.shelf||""); }catch(e){}
+      var one = !pickFullOn();
+      var extra = ''
+        + (sh ? '<button class="btn sm primary" onclick="ssSelectShelfFull(\''+String(sh).replace(/'/g,"\\'")+'\')">⬜ کل قفسهٔ '+esc(sh)+' (همهٔ موجودی)</button>' : '')
+        + '<button class="btn sm" onclick="ssFillSelectedToAvail()">مقدار = موجودی انبار</button>'
+        + '<button class="chip '+(one?'':'active')+'" onclick="ssSetPickMode('+(one?'false':'true')+')">'
+        + (one ? 'انتخاب هر ردیف: ۱ ورق' : 'انتخاب هر ردیف: همهٔ موجودی') + '</button>';
+      return h.slice(0,end) + extra + h.slice(end);
+    };
+  }
+
+})();
+
+
+/* ================= ROUND 23: ممیزی کامل — محافظت موجودی منفی، دسترسی فروشنده، پورسانت ایمن ================= */
+(function(){
+
+  /* ---------- 1) هیچ عملیاتی نباید موجودی را منفی کند ---------- */
+  function balOf(pid, wh){
+    try{ return Number(InventoryEngine.getBalance(pid, wh))||0; }
+    catch(e){
+      try{ var p=getProd(pid); return Number(p && p.stock && p.stock[wh])||0; }catch(e2){ return 0; }
+    }
+  }
+  function nameOf(pid){ try{ return prodName(getProd(pid)); }catch(e){ return ""; } }
+  function whOf(wh){ try{ return whName(wh); }catch(e){ return String(wh||""); } }
+
+  function shortageError(pid, wh, qty, bal){
+    var msg = "موجودی کافی نیست: " + nameOf(pid) + " — انبار " + whOf(wh)
+      + " موجودی " + faNum(bal) + " ورق، درخواست " + faNum(qty) + " ورق";
+    var err = new Error("INSUFFICIENT_STOCK");
+    err.fa = msg;
+    err.code = "INSUFFICIENT_STOCK";
+    return err;
+  }
+
+  if(typeof InventoryEngine==="object" && InventoryEngine && typeof InventoryEngine.sell==="function"){
+    var _o_sell23 = InventoryEngine.sell.bind(InventoryEngine);
+    InventoryEngine.sell = function(opts){
+      var o = opts||{};
+      var qty = Number(o.quantity)||0;
+      var bal = balOf(o.productId, o.warehouseId);
+      if(qty>0 && bal - qty < 0 && window.__allowNegativeStock!==true){
+        var e = shortageError(o.productId, o.warehouseId, qty, bal);
+        try{ toast(e.fa); }catch(x){}
+        throw e;
+      }
+      return _o_sell23(o);
+    };
+  }
+
+  if(typeof InventoryEngine==="object" && InventoryEngine && typeof InventoryEngine.transferOut==="function"){
+    var _o_tout23 = InventoryEngine.transferOut.bind(InventoryEngine);
+    InventoryEngine.transferOut = function(opts){
+      var o = opts||{};
+      var qty = Number(o.quantity)||0;
+      var bal = balOf(o.productId, o.warehouseId);
+      if(qty>0 && bal - qty < 0 && window.__allowNegativeStock!==true){
+        var e = shortageError(o.productId, o.warehouseId, qty, bal);
+        try{ toast(e.fa); }catch(x){}
+        throw e;
+      }
+      return _o_tout23(o);
+    };
+  }
+
+  if(typeof InventoryEngine==="object" && InventoryEngine && typeof InventoryEngine.adjust==="function"){
+    var _o_adj23 = InventoryEngine.adjust.bind(InventoryEngine);
+    InventoryEngine.adjust = function(opts){
+      var o = opts||{};
+      var nq = Number(o.newQuantity);
+      if(!isFinite(nq) || nq < 0){
+        var e = new Error("NEGATIVE_QUANTITY");
+        e.fa = "مقدار موجودی نمی‌تواند منفی باشد.";
+        try{ toast(e.fa); }catch(x){}
+        throw e;
+      }
+      return _o_adj23(o);
+    };
+  }
+
+  /* گزارش موجودی منفی موجود در داده‌های قبلی + امکان صفر کردن */
+  window.negStockRows = function(){
+    return (DB.products||[]).filter(function(p){
+      return (Number(p.stock&&p.stock.qom)||0) < 0 || (Number(p.stock&&p.stock.jaf)||0) < 0;
+    });
+  };
+  window.negStockFix = async function(){
+    var rows = negStockRows();
+    if(!rows.length){ toast("موجودی منفی وجود ندارد."); return; }
+    if(typeof uiConfirm==="function"){
+      var ok = await uiConfirm("تعداد "+faNum(rows.length)+" کالا موجودی منفی دارد. همه روی صفر تنطیم شود؟");
+      if(!ok) return;
+    }
+    var n=0;
+    rows.forEach(function(p){
+      ["qom","jaf"].forEach(function(w){
+        if((Number(p.stock[w])||0) < 0){ p.stock[w]=0; n++; }
+      });
+    });
+    try{ save(); rebuildIndex(); }catch(e){}
+    try{ logAct("inventory", "صفر کردن موجودی منفی — "+n+" خانه"); }catch(e){}
+    try{ render(); }catch(e){}
+    toast(faNum(n)+" خانهٔ موجودی منفی اصلاح شد.");
+  };
+
+  /* ---------- 2) دسترسی‌های مدیریتی ---------- */
+  function mgrOnly(fnName, msg){
+    if(typeof window[fnName]!=="function") return;
+    var orig = window[fnName];
+    window[fnName] = function(){
+      var ok = false;
+      try{ ok = isManager(); }catch(e){}
+      if(!ok){ try{ toast(msg); }catch(e){} return; }
+      return orig.apply(this, arguments);
+    };
+  }
+
+  var MSG_SUP = "بخش خرید و کارخانه‌ها فقط برای مدیر است.";
+  var MSG_COM = "تنطیم نرخ پورسانت فقط توسط مدیر انجام می‌شود.";
+
+  ["openSupplier","saveSupplier","openPurchase","savePurchase","purDelete","purSettleConsign",
+   "openSupPay","saveSupPay","supPayDelete","supChequeSet","openSupAccount","supSyncFromEntries",
+   "supExport","supExportAll","accAllExport"].forEach(function(fn){ mgrOnly(fn, MSG_SUP); });
+
+  ["openCommissionRule","saveCommissionRule","deleteCommissionRule","openCommissionPayout",
+   "saveCommissionPayout"].forEach(function(fn){ mgrOnly(fn, MSG_COM); });
+
+  /* ---------- 3) پورسانت بدون NaN ---------- */
+  function fin(n){ n = Number(n); return isFinite(n) ? n : 0; }
+
+  if(typeof lineCommission==="function"){
+    var _o_lc23 = lineCommission;
+    lineCommission = function(){
+      var r;
+      try{ r = _o_lc23.apply(this, arguments); }catch(e){ return {amount:0, rule:null}; }
+      if(!r) return {amount:0, rule:null};
+      r.amount = Math.round(fin(r.amount));
+      return r;
+    };
+  }
+
+  if(typeof invoiceCommission==="function"){
+    var _o_ic23 = invoiceCommission;
+    invoiceCommission = function(){
+      var r;
+      try{ r = _o_ic23.apply(this, arguments); }catch(e){ return {amount:0, lines:[], flat:0}; }
+      if(!r) return {amount:0, lines:[], flat:0};
+      r.amount = Math.round(fin(r.amount));
+      r.flat = Math.round(fin(r.flat));
+      (r.lines||[]).forEach(function(l){ l.amount = Math.round(fin(l.amount)); });
+      return r;
+    };
+  }
+
+  if(typeof sellerStats==="function"){
+    var _o_ss23 = sellerStats;
+    sellerStats = function(){
+      var r;
+      try{ r = _o_ss23.apply(this, arguments); }catch(e){ return {seller:"", invoices:0, sales:0, commission:0}; }
+      if(!r || typeof r!=="object") return r;
+      ["sales","sheets","area","meters","profit","commission","paid","due"].forEach(function(k){
+        if(k in r) r[k] = fin(r[k]);
+      });
+      return r;
+    };
+  }
+
+  if(typeof financeSummary==="function"){
+    var _o_fs23 = financeSummary;
+    financeSummary = function(){
+      var r = _o_fs23.apply(this, arguments);
+      if(!r || typeof r!=="object") return r;
+      Object.keys(r).forEach(function(k){
+        if(typeof r[k]==="number" && !isFinite(r[k])) r[k] = 0;
+      });
+      return r;
+    };
+  }
+
+  /* پاک‌سازی قواعد پورسانت معیوب (نرخ غیرعددی) */
+  window.commissionRulesRepair = function(){
+    var bad = 0;
+    (DB.commissionRules||[]).forEach(function(r){
+      var rate = Number(r.rate);
+      if(!isFinite(rate) || rate<=0){ r.active = false; r._invalid = true; bad++; }
+    });
+    if(bad){ try{ save(); }catch(e){} }
+    return bad;
+  };
+  try{ commissionRulesRepair(); }catch(e){}
+
+})();
 
 </script>
 </body>
