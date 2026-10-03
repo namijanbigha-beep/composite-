@@ -10095,7 +10095,7 @@ function cat6FastAddConfirm(){
 
 /* =============== boot =============== */
 /* =============== v5: online sync (Firebase RTDB REST) =============== */
-const APP_VERSION="۷.۲";
+const APP_VERSION="۷.۳";
 const SYNC={url:localStorage.getItem("cs_sync_url")||"",auth:localStorage.getItem("cs_sync_auth")||"",status:"off",err:"",last:Number(localStorage.getItem("cs_sync_at")||0),pushT:null,pulling:false,conflicts:[]};
 
 // Version tracking for conflict detection
@@ -17426,6 +17426,605 @@ window.invPayNow=function(invId,cid){
     window.savePayment = savePayment;
   }catch(e){}
 
+})();
+
+
+/* ============ ROUND 21: همگام‌سازی ایمن + برگشت وجه + تسویه از اعتبار + جلوگیری از تکراری ============ */
+(function(){
+"use strict";
+var R21_VER="۷.۳";
+var fa=function(n){try{return faNum(n)}catch(e){return String(n)}};
+
+/* ---------- 0) پشتیبان ایمنی پیش از هر عمل جایگزینی ---------- */
+var SAFETY_KEY="cs_safety_backup";
+function r21SafetyBackup(reason){
+  try{
+    var snap={time:new Date().toISOString(),reason:reason||"",counts:srvCounts(DB),db:DB};
+    localStorage.setItem(SAFETY_KEY,JSON.stringify(snap));
+  }catch(e){
+    toast("نسخهٔ ایمنی ساخته نشد؛ فضای مرورگر کافی نیست. عملیات متوقف شد و نسخهٔ قبلی حفظ شد.");
+    return false;
+  }
+  try{auditLog("safety_backup",reason||"")}catch(e){}
+  return true;
+}
+function r21SafetyInfo(){
+  try{var raw=localStorage.getItem(SAFETY_KEY);if(!raw)return null;var j=JSON.parse(raw);return j&&j.db?j:null}catch(e){return null}
+}
+window.r21RestoreSafety=async function(){
+  var s=r21SafetyInfo();
+  if(!s){toast("نسخهٔ ایمنی وجود ندارد.");return}
+  var c=s.counts||{};
+  var ok=await uiConfirm("دادهٔ فعلی این دستگاه با نسخهٔ ایمنی "+faDateTime(s.time)+" ("+fa(c.p||0)+" کالا، "+fa(c.i||0)+" فاکتور، "+fa(c.c||0)+" مشتری) جایگزین شود؟");
+  if(!ok)return;
+  if(!r21SafetyBackup("پیش از بازگردانی نسخهٔ ایمنی"))return;
+  Object.keys(DB).forEach(function(k){delete DB[k]});
+  Object.keys(s.db).forEach(function(k){DB[k]=s.db[k]});
+  srvDefaults();
+  try{rebuildIndex()}catch(e){}
+  try{syInvalidate()}catch(e){}
+  save();closeModal();render();
+  toast("نسخهٔ ایمنی بازگردانده شد.");
+};
+
+/* تأیید تایپی برای کارهای برگشت‌ناپذیر */
+async function r21TypedConfirm(msg,word){
+  var v=await uiPrompt(msg+" — برای تأیید، کلمهٔ «"+word+"» را بنویسید:","");
+  return v!=null&&String(v).trim()===word;
+}
+
+/* ---------- 1) ادغام ایمن (هیچ‌وقت چیزی را پاک نمی‌کند) ---------- */
+/* دستگاه تازه = هیچ فاکتور/مشتری/دریافت/ورود کالایی ندارد و کالاهایش فقط همان فهرست اولیهٔ داخل کد است */
+function r21IsSeedOnly(){
+  var ps=DB.products||[];
+  if(!ps.length)return true;
+  var seedPs;try{seedPs=seed().products}catch(e){return false}
+  if(ps.length!==seedPs.length)return false;
+  var sig=function(p){return [p.brand,p.color,p.width,p.length,(p.stock||{}).qom||0,(p.stock||{}).jaf||0,p.salePrice||0,p.costPrice||0,p.shelf||""].join("|")};
+  var a=ps.map(sig).sort().join("\n"),b=seedPs.map(sig).sort().join("\n");
+  return a===b;
+}
+function r21IsFreshDevice(){
+  return !(DB.invoices||[]).length&&!(DB.customers||[]).length&&!(DB.payments||[]).length&&!(DB.entries||[]).length&&
+    !(DB.truckHistory||[]).length&&!(DB.stocktaking||[]).length&&r21IsSeedOnly();
+}
+function r21NumOf(s){var n=Number(String(s==null?"":s).replace(/[^0-9]/g,""));return isFinite(n)?n:0}
+function r21InvSig(v){
+  var items=(v.items||[]).map(function(i){return [i.width,i.length,i.qty,i.price].join("x")}).sort().join(",");
+  return [String(v.number),String(v.customerId||""),String(v.type||"invoice"),Math.round(invTotal(v)),items].join("|");
+}
+function r21PhoneNorm(p){return latinDigits(String(p==null?"":p)).replace(/\D/g,"").replace(/^0098/,"0").replace(/^98/,"0")}
+/* ادغام: رکوردهای تازهٔ طرف مقابل اضافه می‌شود؛ رکوردهای مشترک از طرفی گرفته می‌شود که تازه‌تر است */
+function r21Merge(inc,opts){
+  opts=opts||{};
+  srvDefaults();
+  var rep={products:0,rows:0,skippedDupInvoices:0,skippedDupCustomers:0,balanceConflicts:0};
+  var preferRemote=!!opts.preferRemote;
+  function preserveOpeningBalance(local,remote){
+    if(!local||!remote)return;
+    var lv=Number(local.openingBalance!=null?local.openingBalance:local.balance)||0;
+    var rv=Number(remote.openingBalance!=null?remote.openingBalance:remote.balance)||0;
+    if(lv===0&&rv!==0){local.openingBalance=rv;if(local.balance!=null)delete local.balance}
+    else if(lv!==0&&rv!==0&&lv!==rv)rep.balanceConflicts++;
+  }
+  /* کالاها بر اساس کلید برند/رنگ/عرض/طول */
+  var byKey=Object.create(null),byId=Object.create(null);
+  DB.products.forEach(function(p){byKey[xferKeyOf(p)]=p;if(p&&p.id!=null)byId[p.id]=p});
+  (inc.products||[]).forEach(function(ip){
+    if(!ip)return;
+    var lp=(ip.id!=null&&byId[ip.id])||byKey[xferKeyOf(ip)];
+    if(lp){
+      if(preferRemote){Object.keys(ip).forEach(function(k){lp[k]=ip[k]})}
+      else{var st=lp.stock;Object.keys(ip).forEach(function(k){if(k!=="stock")lp[k]=ip[k]});lp.stock=st}
+    }else{DB.products.push(ip);rep.products++;byKey[xferKeyOf(ip)]=ip;if(ip.id!=null)byId[ip.id]=ip}
+  });
+  /* مشتری: تکراری با موبایل یکسان اضافه نمی‌شود */
+  var phones=Object.create(null);
+  DB.customers.forEach(function(c){var k=r21PhoneNorm(c.phone);if(k)phones[k]=c});
+  var custMap=Object.create(null); /* شناسهٔ مشتری ورودی → شناسهٔ محلی */
+  var cids=Object.create(null);DB.customers.forEach(function(c){if(c&&c.id!=null)cids[c.id]=1});
+  (inc.customers||[]).forEach(function(c){
+    if(!c)return;
+    if(c.id!=null&&cids[c.id]){var same=DB.customers.find(function(x){return x&&x.id===c.id});preserveOpeningBalance(same,c);return}
+    var k=r21PhoneNorm(c.phone);
+    if(k&&phones[k]){preserveOpeningBalance(phones[k],c);custMap[c.id]=phones[k].id;rep.skippedDupCustomers++;return}
+    DB.customers.push(c);cids[c.id]=1;if(k)phones[k]=c;rep.rows++;
+  });
+  /* فاکتور: شمارهٔ یکسان + مشتری یکسان + اقلام یکسان = تکراری */
+  var sigs=Object.create(null);DB.invoices.forEach(function(v){try{sigs[r21InvSig(v)]=1}catch(e){}});
+  var vids=Object.create(null);DB.invoices.forEach(function(v){if(v&&v.id!=null)vids[v.id]=1});
+  (inc.invoices||[]).forEach(function(v){
+    if(!v)return;
+    if(v.id!=null&&vids[v.id])return;
+    if(custMap[v.customerId])v.customerId=custMap[v.customerId];
+    var s="";try{s=r21InvSig(v)}catch(e){}
+    if(s&&sigs[s]){rep.skippedDupInvoices++;return}
+    DB.invoices.push(v);vids[v.id]=1;if(s)sigs[s]=1;rep.rows++;
+  });
+  (inc.payments||[]).forEach(function(p){if(p&&custMap[p.customerId])p.customerId=custMap[p.customerId]});
+  ["payments","entries","cards","truckHistory","stocktaking","inventoryReservations","inventoryTransactions",
+   "proformaSupplies","customerPrices","adjustments","accounts","auditLog","activity","expenses","staff","statements","roles","commissionRules","commissionPayouts","pendingMin"].forEach(function(key){
+    if(!Array.isArray(inc[key]))return;
+    if(!Array.isArray(DB[key]))DB[key]=[];
+    var seen=Object.create(null);DB[key].forEach(function(x){if(x&&x.id!=null)seen[x.id]=1});
+    inc[key].forEach(function(x){if(!x)return;if(x.id!=null&&seen[x.id])return;DB[key].push(x);if(x.id!=null)seen[x.id]=1;rep.rows++});
+  });
+  /* تنظیمات و شمارنده‌ها: بزرگ‌ترین شماره برنده است تا شمارهٔ تکراری ساخته نشود */
+  if(inc.settings&&typeof inc.settings==="object"){
+    DB.settings=DB.settings||{};
+    Object.keys(inc.settings).forEach(function(k){if(DB.settings[k]===undefined)DB.settings[k]=inc.settings[k]});
+  }
+  r21FixCounters();
+  return rep;
+}
+function r21FixCounters(){
+  DB.counters=DB.counters||{invoice:1000,proforma:1000,receipt:1000,entry:1000};
+  var s=numbering();
+  var maxInv=0,maxPro=0,maxRec=0;
+  (DB.invoices||[]).forEach(function(v){var n=r21NumOf(v.number);if(v.type==="proforma"){if(n>maxPro)maxPro=n}else if(n>maxInv)maxInv=n});
+  (DB.payments||[]).forEach(function(p){var n=r21NumOf(p.number);if(n>maxRec)maxRec=n});
+  s.invNext=Math.max(Number(s.invNext)||0,maxInv+1);
+  s.proNext=Math.max(Number(s.proNext)||0,maxPro+1);
+  DB.counters=DB.counters||{};
+  DB.counters.invoice=s.invNext-1;DB.counters.proforma=s.proNext-1;
+  DB.counters.receipt=Math.max(Number(DB.counters.receipt)||0,maxRec);
+}
+window.r21Merge=r21Merge;
+
+/* ادغام خودکار همگام‌سازی هم از همین مسیر ایمن می‌رود */
+syncMerge=function(incoming){
+  if(!incoming||!incoming.db)return false;
+  var inc=incoming.db;
+  var rep=r21Merge(inc,{preferRemote:!srvLocalDirty()});
+  try{auditLog("sync_merge","ادغام ایمن: "+rep.products+" کالا، "+rep.rows+" ردیف"+(rep.skippedDupInvoices?"، "+rep.skippedDupInvoices+" فاکتور تکراری رد شد":"")+(rep.balanceConflicts?"، "+rep.balanceConflicts+" اختلاف مانده برای بررسی":""))}catch(e){}
+  return true;
+};
+
+/* پنجرهٔ انتخاب جهت: دیگر گزینهٔ «جایگزین شود» ندارد */
+syncAskDirection=function(loc,rem){
+  return new Promise(function(res){
+    window.__syncDir=function(v){res(v);closeModal()};
+    openModal('<h3>همگام‌سازی با سرور</h3>'+
+      '<div class="muted" style="line-height:2;margin-bottom:10px">هم این دستگاه و هم سرور داده دارند. در روش ایمن، هیچ‌کدام پاک نمی‌شود: موارد تازهٔ هر طرف به طرف دیگر اضافه می‌شود و تکراری‌ها (مشتری با موبایل یکسان، فاکتور با شمارهٔ یکسان) کنار گذاشته می‌شوند.</div>'+
+      '<table class="tbl" style="margin-bottom:12px"><thead><tr><th></th><th>کالا</th><th>فاکتور</th><th>مشتری</th></tr></thead><tbody>'+
+      '<tr><td>این دستگاه</td><td>'+fa(loc.p)+'</td><td>'+fa(loc.i)+'</td><td>'+fa(loc.c)+'</td></tr>'+
+      '<tr><td>سرور</td><td>'+fa(rem.p)+'</td><td>'+fa(rem.i)+'</td><td>'+fa(rem.c)+'</td></tr>'+
+      '</tbody></table>'+
+      '<div style="display:flex;flex-direction:column;gap:8px">'+
+      '<button class="btn primary" onclick="__syncDir(\'merge\')">✅ ادغام ایمن (پیشنهادی)</button>'+
+      '<button class="btn" onclick="__syncDir(\'cancel\')">انصراف</button></div>'+
+      '<div class="sub" style="margin-top:8px">جایگزینی کامل فقط از بخش «نگهداری» و با تأیید تایپی ممکن است.</div>',true);
+  });
+};
+
+/* اتصال: هیچ مسیری دادهٔ یک دستگاه کاردار را پاک نمی‌کند */
+syncConnect=async function(){
+  var u=srvSaveFields();
+  if(!u){toast("آدرس سرور را وارد کنید.");return false}
+  var res=await busyRun("اتصال به سرور",async function(){
+    var out={data:null,err:""};
+    try{
+      busyStep("بررسی سرور…",4);
+      var r=await srvXhr({url:syncEndpoint(),timeout:45000,
+        onDown:function(l,tt){if(tt)busyTick(l,tt,"دریافت از سرور");else busyStep("دریافت "+srvKB(l))}});
+      SRV.downBytes=(r.text||"").length;
+      busyStep("خواندن داده…",96);
+      out.data=JSON.parse(r.text||"null");
+      busyStep("",100);
+    }catch(e){out.err=(e&&e.message)||"error"}
+    return out;
+  });
+  if(res.err){
+    SYNC.status="err";SYNC.err="اتصال به سرور برقرار نشد ("+res.err+")";syncBadge();
+    toast(SYNC.err+" — آدرس و رمز را بررسی کنید.");return false;
+  }
+  var data=res.data;
+  var rem=(data&&data.db)?srvCounts(data.db):{p:0,i:0,c:0};
+  var loc=srvCounts(DB);
+  var remoteHas=rem.p>0||rem.i>0||rem.c>0;
+  if(!remoteHas){
+    var okp=await uiConfirm("سرور خالی است. دادهٔ این دستگاه ("+fa(loc.p)+" کالا، "+fa(loc.i)+" فاکتور، "+fa(loc.c)+" مشتری) به عنوان دادهٔ اولیهٔ سرور ارسال شود؟");
+    if(!okp){toast("انصراف");return false}
+    var ok=await busyRun("ارسال به سرور",function(){return syncPush({force:true,progress:true})});
+    closeModal();render();
+    toast(ok?"ارسال شد: "+fa(loc.p)+" کالا روی سرور قرار گرفت":"ارسال به سرور ناموفق بود");
+    return ok;
+  }
+  var dir=await syncAskDirection(loc,rem);
+  if(dir!=="merge"){toast("انصراف");return false}
+  if(!r21SafetyBackup("پیش از ادغام با سرور"))return false;
+  var out=await busyRun("ادغام و ارسال",async function(){
+    busyStep("ادغام داده",20);
+    var rep=r21Merge(data.db,{preferRemote:!srvLocalDirty()});
+    syncSetStamp(Number(data.updatedAt)||Date.now());
+    save();
+    try{rebuildIndex()}catch(e){}
+    try{syInvalidate()}catch(e){}
+    var ok1=await syncPush({force:true,progress:true});
+    return {rep:rep,ok:ok1};
+  });
+  closeModal();render();
+  toast("ادغام شد: "+fa(out.rep.products)+" کالا و "+fa(out.rep.rows)+" ردیف تازه"+
+    (out.rep.skippedDupInvoices||out.rep.skippedDupCustomers?" — "+fa(out.rep.skippedDupInvoices)+" فاکتور و "+fa(out.rep.skippedDupCustomers)+" مشتری تکراری کنار گذاشته شد":"")+
+    (out.rep.balanceConflicts?" — "+fa(out.rep.balanceConflicts)+" اختلاف ماندهٔ مشتری برای بررسی دستی":"")+
+    (out.ok?"":" — ارسال به سرور ناموفق"));
+  return out.ok;
+};
+
+/* ارسال خودکار: اگر سرور تازه‌تر از این دستگاه است، اول دریافت و ادغام، بعد ارسال (تا دادهٔ دستگاه دیگر پاک نشود) */
+var _o_syncPush21=syncPush;
+syncPush=async function(o){
+  o=o||{};
+  if(SYNC.url&&!o.force&&!SYNC.pulling&&!window.__r21Pulling){
+    try{
+      var remoteAt=await srvMeta();
+      if(remoteAt>syncStamp()){
+        window.__r21Pulling=true;
+        try{await syncPull({force:true})}finally{window.__r21Pulling=false}
+      }
+    }catch(e){}
+  }
+  return _o_syncPush21.call(this,o);
+};
+
+/* دریافت کامل / ارسال کامل: فقط با تأیید تایپی و با پشتیبان ایمنی */
+window.srvPullFull=async function(){
+  var u=srvSaveFields();
+  if(!u){toast("آدرس سرور را وارد کنید.");return false}
+  var data=null;
+  try{
+    await busyRun("دریافت از سرور",async function(){
+      var r=await srvXhr({url:syncEndpoint(),timeout:60000});
+      data=JSON.parse(r.text||"null");
+    });
+  }catch(e){toast("دریافت ناموفق ("+((e&&e.message)||"")+")");return false}
+  if(!data||!data.db||!(data.db.products||[]).length){toast("سرور هنوز داده‌ای ندارد.");return false}
+  var rem=srvCounts(data.db),loc=srvCounts(DB);
+  {
+    var ok=await r21TypedConfirm("⚠ دادهٔ این دستگاه ("+fa(loc.p)+" کالا، "+fa(loc.i)+" فاکتور، "+fa(loc.c)+" مشتری) پاک و با دادهٔ سرور ("+fa(rem.p)+" کالا، "+fa(rem.i)+" فاکتور، "+fa(rem.c)+" مشتری) جایگزین می‌شود. نسخهٔ ایمنی از دادهٔ فعلی نگه داشته می‌شود.","جایگزین");
+    if(!ok){toast("انصراف");return false}
+    if(!r21SafetyBackup("پیش از دریافت کامل از سرور"))return false;
+  }
+  srvApplyRemote(data);r21FixCounters();save();
+  closeModal();render();
+  toast("دریافت شد: "+fa(rem.p)+" کالا، "+fa(rem.i)+" فاکتور");
+  return true;
+};
+window.srvPushNow=async function(){
+  /* ارسال کامل می‌تواند دادهٔ سرور را پاک کند؛ دکمهٔ عادی همیشه ادغام را اجرا می‌کند. */
+  return syncConnect();
+};
+window.srvPullNow=async function(){
+  if(!srvSaveFields()){toast("آدرس سرور را وارد کنید.");return}
+  await busyRun("دریافت از سرور…",async function(){await syncPull({progress:true,force:true})});
+  toast(SYNC.status==="ok"?"داده‌ها دریافت و ادغام شد.":(SYNC.err||"دریافت ناموفق بود."));
+};
+
+/* انتقال با فایل: حالت «جایگزینی» هم تأیید تایپی می‌خواهد */
+var _o_xferImport21=window.xferImport;
+if(typeof _o_xferImport21==="function"){
+  window.xferImport=async function(mode){
+    if(mode!=="merge"){
+      var ok=await r21TypedConfirm("⚠ جایگزینی کامل، همهٔ دادهٔ این دستگاه را پاک می‌کند. نسخهٔ ایمنی نگه داشته می‌شود.","جایگزین");
+      if(!ok){toast("انصراف");return false}
+      if(!r21SafetyBackup("پیش از جایگزینی با فایل انتقال"))return false;
+    }
+    var r=await _o_xferImport21.apply(this,arguments);
+    try{r21FixCounters();save()}catch(e){}
+    return r;
+  };
+}
+
+/* پنل سرور: دکمهٔ «دریافت کامل» به بخش نگهداری می‌رود و دکمهٔ بازگردانی اضافه می‌شود */
+var _o_openSync21=openSync;
+openSync=function(){
+  var r=_o_openSync21.apply(this,arguments);
+  try{
+    var m=document.querySelector("#modal-root .modal");
+    if(!m)return r;
+    var old=document.getElementById("sy-fullpull");
+    if(old&&old.parentNode)old.parentNode.remove();
+    var s=r21SafetyInfo();
+    var d=document.createElement("details");
+    d.style.cssText="margin-top:10px;padding-top:10px;border-top:1px solid rgba(0,0,0,.12)";
+    d.innerHTML='<summary class="muted" style="cursor:pointer">نگهداری (کارهای برگشت‌ناپذیر)</summary>'+
+      '<div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">'+
+      '<button class="btn sm" onclick="withBusy(this,srvPullFull)">⬇ دریافت کامل از سرور (جایگزینی این دستگاه — با تأیید تایپی)</button>'+
+      (s?'<button class="btn sm" onclick="r21RestoreSafety()">↩ بازگردانی نسخهٔ ایمنی '+faDateTime(s.time)+' ('+fa((s.counts||{}).i||0)+' فاکتور)</button>':'<div class="sub">هنوز نسخهٔ ایمنی‌ای ساخته نشده (پیش از هر ادغام یا جایگزینی خودکار ساخته می‌شود).</div>')+
+      '<button class="btn sm" onclick="r21DedupTool()">🧹 یافتن و ادغام مشتری/فاکتور تکراری</button>'+
+      '</div>';
+    m.appendChild(d);
+  }catch(e){}
+  return r;
+};
+
+/* ---------- 2) ابزار یافتن و ادغام تکراری‌ها ---------- */
+function r21FindDups(){
+  var custGroups=[],invGroups=[];
+  var byPhone=Object.create(null);
+  (DB.customers||[]).filter(function(c){return c&&!c._deleted}).forEach(function(c){
+    var k=r21PhoneNorm(c.phone);if(!k)return;(byPhone[k]=byPhone[k]||[]).push(c);
+  });
+  Object.keys(byPhone).forEach(function(k){if(byPhone[k].length>1)custGroups.push(byPhone[k])});
+  var bySig=Object.create(null);
+  (DB.invoices||[]).forEach(function(v){var s;try{s=r21InvSig(v)}catch(e){return}(bySig[s]=bySig[s]||[]).push(v)});
+  Object.keys(bySig).forEach(function(s){if(bySig[s].length>1)invGroups.push(bySig[s])});
+  return {custGroups:custGroups,invGroups:invGroups};
+}
+function r21MergeCustomers(group){
+  /* قدیمی‌ترین (یا اولی) می‌ماند؛ بقیه به آن منتقل می‌شوند */
+  group.sort(function(a,b){return String(a.createdAt||"").localeCompare(String(b.createdAt||""))});
+  var keep=group[0];
+  group.slice(1).forEach(function(c){
+    (DB.invoices||[]).forEach(function(v){if(v.customerId===c.id)v.customerId=keep.id});
+    (DB.payments||[]).forEach(function(p){if(p.customerId===c.id)p.customerId=keep.id});
+    (DB.customerPrices||[]).forEach(function(p){if(p.customerId===c.id)p.customerId=keep.id});
+    (DB.statements||[]).forEach(function(s){if(s.customerId===c.id)s.customerId=keep.id});
+    var op=Number(c.openingBalance!=null?c.openingBalance:c.balance)||0;
+    if(op){keep.openingBalance=(Number(keep.openingBalance!=null?keep.openingBalance:keep.balance)||0)+op}
+    if(!keep.address&&c.address)keep.address=c.address;
+    DB.customers=DB.customers.filter(function(x){return x.id!==c.id});
+  });
+}
+function r21MergeInvoices(group){
+  group.sort(function(a,b){return String(a.createdAt||a.date||"").localeCompare(String(b.createdAt||b.date||""))});
+  var keep=group[0];
+  group.slice(1).forEach(function(v){
+    (DB.payments||[]).forEach(function(p){if(p.invoiceId===v.id)p.invoiceId=keep.id});
+    (DB.inventoryTransactions||[]).forEach(function(t){if(t.referenceId===v.id)t._dupOf=keep.id});
+    DB.invoices=DB.invoices.filter(function(x){return x.id!==v.id});
+  });
+}
+window.r21DedupTool=async function(){
+  if(typeof isManager==="function"&&!isManager()){toast("فقط مدیر می‌تواند تکراری‌ها را ادغام کند.");return}
+  var d=r21FindDups();
+  if(!d.custGroups.length&&!d.invGroups.length){toast("مشتری یا فاکتور تکراری پیدا نشد ✔");return}
+  var h='<h3>تکراری‌های پیدا شده</h3>';
+  if(d.custGroups.length){
+    h+='<div class="notice">'+fa(d.custGroups.length)+' شمارهٔ موبایل با بیش از یک پروندهٔ مشتری:</div><div class="tblwrap" style="max-height:160px;overflow:auto"><table class="tbl"><thead><tr><th>موبایل</th><th>پرونده‌ها</th></tr></thead><tbody>'+
+      d.custGroups.map(function(g){return '<tr><td class="num">'+esc(g[0].phone)+'</td><td>'+g.map(function(c){return esc(c.name)}).join(" / ")+'</td></tr>'}).join("")+'</tbody></table></div>';
+  }
+  if(d.invGroups.length){
+    h+='<div class="notice" style="margin-top:8px">'+fa(d.invGroups.length)+' فاکتور با شماره، مشتری و اقلام یکسان که بیش از یک بار ثبت شده:</div><div class="tblwrap" style="max-height:160px;overflow:auto"><table class="tbl"><thead><tr><th>شماره</th><th>مشتری</th><th>تعداد نسخه</th></tr></thead><tbody>'+
+      d.invGroups.map(function(g){var c=getCust(g[0].customerId);return '<tr><td class="num">'+esc(String(g[0].number))+'</td><td>'+esc(c?c.name:"—")+'</td><td class="num">'+fa(g.length)+'</td></tr>'}).join("")+'</tbody></table></div>';
+  }
+  h+='<div class="sub" style="margin-top:8px">در ادغام، قدیمی‌ترین پرونده می‌ماند و فاکتورها و دریافت‌های بقیه به آن منتقل می‌شود. از فاکتورهای تکراری هم فقط اولی می‌ماند. موجودی انبار خودکار اصلاح نمی‌شود؛ بعد از ادغام با انبارگردانی تطبیق دهید. پیش از ادغام نسخهٔ ایمنی ساخته می‌شود.</div>'+
+    '<div class="actions"><button class="btn primary" onclick="r21DedupApply()">ادغام تکراری‌ها</button><button class="btn" onclick="closeModal()">بستن</button></div>';
+  openModal(h,true);
+};
+window.r21DedupApply=async function(){
+  var ok=await uiConfirm("تکراری‌ها ادغام شوند؟ (نسخهٔ ایمنی ساخته می‌شود)");
+  if(!ok)return;
+  if(!r21SafetyBackup("پیش از ادغام تکراری‌ها"))return;
+  var d=r21FindDups();
+  d.custGroups.forEach(r21MergeCustomers);
+  d.invGroups.forEach(r21MergeInvoices);
+  (DB.invoices||[]).filter(function(v){return v.type==="invoice"}).forEach(refreshInvStatus);
+  r21FixCounters();
+  try{auditLog("dedup","ادغام "+d.custGroups.length+" گروه مشتری و "+d.invGroups.length+" گروه فاکتور تکراری")}catch(e){}
+  save();closeModal();render();
+  toast("ادغام شد: "+fa(d.custGroups.length)+" گروه مشتری، "+fa(d.invGroups.length)+" گروه فاکتور");
+};
+
+/* مشتری جدید با موبایل تکراری ساخته نمی‌شود؛ همان پرونده انتخاب می‌شود */
+var _o_saveNewCustomer21=window.saveNewCustomer;
+if(typeof _o_saveNewCustomer21==="function"){
+  window.saveNewCustomer=function(fromInvoice){
+    var el=document.querySelector("#nc-phone");
+    var k=el?r21PhoneNorm(el.value):"";
+    if(k){
+      var ex=(DB.customers||[]).find(function(c){return c&&!c._deleted&&r21PhoneNorm(c.phone)===k});
+      if(ex){
+        closeModal();
+        if(fromInvoice&&typeof draft!=="undefined"&&draft){draft.customerId=ex.id;draft.custQuery="";try{SalesCart.setCustomer(ex.id)}catch(e){}}
+        render();
+        toast("این شماره قبلاً به نام «"+ex.name+"» ثبت شده؛ همان پرونده انتخاب شد.");
+        return;
+      }
+    }
+    return _o_saveNewCustomer21.apply(this,arguments);
+  };
+}
+
+/* ---------- 3) برگشت وجه (پرداخت به مشتری) ---------- */
+var _o_payFormHTML21=window.payFormHTML;
+window.payFormHTML=function(cid,sel,p){
+  p=p||{};
+  var isRef=p.kind==="refund"||(Number(p.amount)||0)<0;
+  var p2=Object.assign({},p,{amount:Math.abs(Number(p.amount)||0)});
+  var html=String(_o_payFormHTML21(cid,sel,p2));
+  var kindSel='<div class="field"><label>نوع</label><select id="pm-kind" onchange="payPreview()">'+
+    '<option value="receive"'+(isRef?"":" selected")+'>دریافت از مشتری</option>'+
+    '<option value="refund"'+(isRef?" selected":"")+'>پرداخت به مشتری (برگشت وجه)</option></select></div>';
+  return html.replace('<div class="grid2">',kindSel+'<div class="grid2">');
+};
+function r21PayKind(){var e=document.querySelector("#pm-kind");return e&&e.value==="refund"?"refund":"receive"}
+window.payPreview=function(){
+  var box=document.querySelector("#pm-preview");if(!box)return;
+  var cid=document.querySelector("#pm-cust").value;
+  var a=deNum(document.querySelector("#pm-amount").value)||0;
+  var signed=r21PayKind()==="refund"?-Math.abs(a):Math.abs(a);
+  var edit=window._payEdit&&window._payEdit.id?payOf(window._payEdit.id):null;
+  var b=custBalance(cid)+(edit&&edit.customerId===cid?Number(edit.amount)||0:0);
+  var after=b-signed;
+  var id=document.querySelector("#pm-inv").value;
+  var v=(DB.invoices||[]).find(function(x){return x.id===id});
+  var extra="";
+  if(v){
+    var rem=payInvRemain(v)+(edit&&edit.invoiceId===v.id?Number(edit.amount)||0:0)-signed;
+    extra='<br>ماندهٔ فاکتور '+fa(v.number)+' پس از این '+(signed<0?"برگشت":"دریافت")+': <b>'+(rem>0?fmt(rem):"تسویه ✔")+'</b>'+
+      (rem<0?'<br><b style="color:var(--red)">⚠ مبلغ از ماندهٔ فاکتور بیشتر است؛ مازاد به حساب کلی می‌رود.</b>':"");
+  }
+  box.innerHTML=(signed<0?"این مبلغ به مشتری پرداخت می‌شود (از طلب او کم / به بدهی او اضافه می‌شود).<br>":"")+
+    'ماندهٔ حساب پس از این عمل: <b>'+payBalText(after)+'</b>'+extra;
+};
+window.savePayment=async function(){
+  var cid=document.querySelector("#pm-cust").value;
+  var amount=Math.abs(deNum(document.querySelector("#pm-amount").value)||0);
+  if(!cid||!(amount>0)){toast("مبلغ را وارد کنید.");return}
+  var kind=r21PayKind();
+  var signed=kind==="refund"?-amount:amount;
+  var dateISO=jdToISO(document.querySelector("#pm-date").value)||todayISO();
+  var invId=document.querySelector("#pm-inv").value;
+  var v=(DB.invoices||[]).find(function(x){return x.id===invId});
+  await withBusy(kind==="refund"?"ثبت برگشت وجه…":"ثبت دریافت…",async function(){
+    DB.counters.receipt=(DB.counters.receipt||0)+1;
+    var rec={id:uid(),number:(kind==="refund"?"B-":"R-")+DB.counters.receipt,kind:kind,customerId:cid,amount:signed,
+      method:document.querySelector("#pm-method").value,date:dateISO,
+      time:String(document.querySelector("#pm-time").value||"").trim(),
+      ref4:latinDigits(String(document.querySelector("#pm-ref4").value||"")).replace(/\D/g,"").slice(-4),
+      invoiceId:v?v.id:"",invoiceNumber:v?String(v.number):"",
+      note:String(document.querySelector("#pm-note").value||"").trim(),
+      createdBy:(session&&session.name)||"",createdAt:new Date().toISOString()};
+    DB.payments.push(rec);
+    (DB.invoices||[]).filter(function(x){return x.customerId===cid&&x.type==="invoice"}).forEach(refreshInvStatus);
+    logAct("payment",(kind==="refund"?"ثبت برگشت وجه ":"ثبت دریافت وجه ")+fmt(amount)+" تومان"+(rec.ref4?" (فیش "+rec.ref4+")":""));
+    save();
+  });
+  closeModal();render();
+  var b=custBalance(cid);
+  toast((kind==="refund"?"برگشت وجه ":"دریافت ")+"ثبت شد — مانده: "+payBalText(b));
+  if(b===0&&kind!=="refund")setTimeout(function(){try{payAskArchive(cid)}catch(e){}},400);
+};
+var _o_savePayEdit21=window.savePayEdit;
+window.savePayEdit=function(){
+  var e=window._payEdit||{};var p=payOf(e.id);if(!p)return;
+  var kind=r21PayKind();
+  var r=_o_savePayEdit21.apply(this,arguments);
+  /* نسخهٔ قدیمی مبلغ را مثبت ذخیره می‌کند؛ علامت را بر اساس نوع درست کن */
+  var p2=payOf(e.id)||p;
+  if(p2){
+    p2.kind=kind;
+    p2.amount=kind==="refund"?-Math.abs(Number(p2.amount)||0):Math.abs(Number(p2.amount)||0);
+    if(kind==="refund"&&/^R-/.test(String(p2.number||"")))p2.number="B-"+String(p2.number).slice(2);
+    if(kind!=="refund"&&/^B-/.test(String(p2.number||"")))p2.number="R-"+String(p2.number).slice(2);
+    (DB.invoices||[]).filter(function(x){return x.type==="invoice"}).forEach(refreshInvStatus);
+    save();
+  }
+  return r;
+};
+/* برچسب و دفتر حساب: برگشت وجه در ستون بدهکار می‌نشیند */
+var _o_payLabel21=window.payLabel;
+window.payLabel=function(p){
+  var s=_o_payLabel21(p);
+  if(p&&(p.kind==="refund"||(Number(p.amount)||0)<0))s=s.replace(/^دریافت/,"پرداخت به مشتری (برگشت وجه)");
+  if(p&&p.kind==="credit_alloc")s=s.replace(/^دریافت/,"تسویه از اعتبار حساب");
+  return s;
+};
+var _o_custEvents21=custEvents;
+custEvents=function(cid){
+  return (_o_custEvents21(cid)||[]).map(function(e){
+    if(e&&e.credit<0)return Object.assign({},e,{debit:(e.debit||0)+(-e.credit),credit:0,label:String(e.label||"").replace(/^دریافت/,"پرداخت به مشتری (برگشت وجه)")});
+    if(e&&e._pay){var p=payOf(e._pay);if(p)e=Object.assign({},e,{label:payLabel(p)})}
+    return e;
+  });
+};
+
+/* ---------- 4) تسویهٔ فاکتور از ماندهٔ بستانکار (اعتبار قبلی) ---------- */
+function r21OpeningCredit(cid){var op=payOpening(cid);return op<0?-op:0}
+/* اضافه‌پرداخت روی فاکتورهای دیگر (مثلاً پیش‌پرداختی که به یک فاکتور وصل شده ولی بیشتر از مبلغ آن است) */
+function r21OverpaidList(cid){
+  return (DB.invoices||[]).filter(function(v){return v.customerId===cid&&v.type==="invoice"&&v.status!=="باطل‌شده"})
+    .map(function(v){return {v:v,excess:Math.round(invPaid(v)-invTotal(v))}})
+    .filter(function(x){return x.excess>0});
+}
+function r21OverpaidCredit(cid){return r21OverpaidList(cid).reduce(function(s,x){return s+x.excess},0)}
+var _o_preCredit21=window.preCredit;
+window.preCredit=function(cid){
+  var unlinked=_o_preCredit21(cid);           /* دریافت‌های آزاد (برگشت‌ها منفی‌اند) */
+  var total=unlinked+r21OpeningCredit(cid)+r21OverpaidCredit(cid);   /* + اعتبار ماندهٔ اولیه + اضافه‌پرداخت فاکتورهای دیگر */
+  return Math.max(0,Math.round(total));
+};
+var _o_preAllocate21=window.preAllocate;
+window.preAllocate=function(invId,limit){
+  var v=(DB.invoices||[]).find(function(x){return x.id===invId});
+  if(!v||v.type!=="invoice"||v.status==="باطل‌شده")return {applied:0,used:[]};
+  var cap=(limit==null?Infinity:Math.max(0,limit));
+  /* ۱) اول دریافت‌های آزاد (منطق قبلی) */
+  var r=_o_preAllocate21(invId,limit)||{applied:0,used:[]};
+  var applied=r.applied||0,used=r.used||[];
+  /* ۲) سپس اضافه‌پرداختِ فاکتورهای دیگر: مازاد از آن فاکتور جدا و به این فاکتور وصل می‌شود */
+  var remain=Math.max(0,invTotal(v)-invPaid(v));
+  r21OverpaidList(v.customerId).forEach(function(x){
+    if(remain<=0||applied>=cap)return;
+    var need=Math.min(remain,x.excess,cap-applied);
+    var pays=(DB.payments||[]).filter(function(p){return p.customerId===v.customerId&&(Number(p.amount)||0)>0&&(p.invoiceId?p.invoiceId===x.v.id:String(p.invoiceNumber||"")===String(x.v.number))})
+      .sort(function(a,b){return (Number(b.amount)||0)-(Number(a.amount)||0)});
+    for(var i=0;i<pays.length&&need>0;i++){
+      var p=pays[i],amt=Number(p.amount)||0;
+      var take=Math.min(amt,need);
+      if(take<=0)continue;
+      p.amount=amt-take;
+      if(p.amount<=0){ /* کل دریافت به فاکتور جدید منتقل می‌شود */
+        p.amount=take;p.invoiceId=v.id;p.invoiceNumber=String(v.number);
+        p.note=(p.note?p.note+" — ":"")+"انتقال از فاکتور "+x.v.number;
+      }else{
+        DB.counters.receipt=(DB.counters.receipt||0)+1;
+        DB.payments.push({id:uid(),number:"R-"+DB.counters.receipt,customerId:v.customerId,amount:take,method:p.method||"",date:p.date,time:p.time||"",ref4:p.ref4||"",
+          invoiceId:v.id,invoiceNumber:String(v.number),note:"انتقال مازاد "+(p.number||"")+" از فاکتور "+x.v.number,fromPrepay:p.id,
+          createdBy:(session&&session.name)||"",createdAt:new Date().toISOString()});
+      }
+      applied+=take;need-=take;remain-=take;used.push({number:p.number,amount:take});
+    }
+    refreshInvStatus(x.v);
+  });
+  if(applied>(r.applied||0)){refreshInvStatus(v);logAct("payment","انتقال "+fmt(applied-(r.applied||0))+" تومان اضافه‌پرداخت به فاکتور "+v.number);save()}
+  /* ۳) سپس اعتبار ماندهٔ اولیه */
+  remain=Math.max(0,invTotal(v)-invPaid(v));
+  var oc=r21OpeningCredit(v.customerId);
+  var take=Math.min(remain,oc,Math.max(0,cap-applied));
+  if(take>0){
+    var c=(DB.customers||[]).find(function(x){return x.id===v.customerId});
+    if(c){
+      c.openingBalance=(Number(c.openingBalance!=null?c.openingBalance:c.balance)||0)+take; /* اعتبار کم می‌شود */
+      if(c.balance!=null)delete c.balance;
+      DB.counters.receipt=(DB.counters.receipt||0)+1;
+      DB.payments.push({id:uid(),number:"R-"+DB.counters.receipt,kind:"credit_alloc",customerId:v.customerId,amount:take,
+        method:"اعتبار حساب",date:todayISO(),time:"",ref4:"",invoiceId:v.id,invoiceNumber:String(v.number),
+        note:"تسویه از ماندهٔ بستانکار قبلی",createdBy:(session&&session.name)||"",createdAt:new Date().toISOString()});
+      applied+=take;used.push({number:"اعتبار حساب",amount:take});
+      refreshInvStatus(v);
+      logAct("payment","تسویهٔ "+fmt(take)+" تومان از اعتبار حساب برای فاکتور "+v.number);
+      save();
+    }
+  }
+  return {applied:applied,used:used,remain:Math.max(0,invTotal(v)-invPaid(v))};
+};
+window.preCreditText=function(cid){var c=preCredit(cid);return c>0?fmt(c)+" تومان اعتبار قابل تخصیص":""};
+
+/* دکمهٔ تسویه از اعتبار در پنل حساب مشتری */
+var _o_openCustAccount21=window.openCustAccount;
+window.openCustAccount=function(cid){
+  _o_openCustAccount21(cid);
+  try{
+    var credit=preCredit(cid);
+    var open=(DB.invoices||[]).filter(function(v){return v.customerId===cid&&v.type==="invoice"&&v.status!=="باطل‌شده"&&invRemain(v)>0});
+    var root=document.querySelector("#modal-root");if(!root)return;
+    var act=root.querySelector(".actions");
+    if(act&&credit>0&&open.length){
+      var b=document.createElement("button");b.className="btn";b.textContent="💳 تسویهٔ فاکتورها از اعتبار ("+fmt(credit)+")";
+      b.onclick=function(){r21SettleFromCredit(cid)};
+      act.appendChild(b);
+    }
+  }catch(e){}
+};
+window.r21SettleFromCredit=async function(cid){
+  var open=(DB.invoices||[]).filter(function(v){return v.customerId===cid&&v.type==="invoice"&&v.status!=="باطل‌شده"&&invRemain(v)>0})
+    .sort(function(a,b){return String(a.date).localeCompare(String(b.date))});
+  var credit=preCredit(cid);
+  if(!open.length||!(credit>0)){toast("فاکتور باز یا اعتباری برای تسویه نیست.");return}
+  var plan=[],left=credit;
+  open.forEach(function(v){if(left<=0)return;var t=Math.min(left,invRemain(v));plan.push({v:v,t:t});left-=t});
+  var ok=await uiConfirm("از اعتبار "+fmt(credit)+" تومانی مشتری، فاکتورهای زیر تسویه شود؟ "+plan.map(function(x){return "فاکتور "+fa(x.v.number)+": "+fmt(x.t)+" تومان"}).join("؛ "));
+  if(!ok)return;
+  var total=0;
+  plan.forEach(function(x){var r=preAllocate(x.v.id,x.t);total+=r.applied||0});
+  openCustAccount(cid);render();
+  toast(fmt(total)+" تومان از اعتبار به فاکتورها منظور شد.");
+};
+
+
+try{console.log("ROUND 21 loaded — نسخه "+R21_VER)}catch(e){}
 })();
 
 </script>
